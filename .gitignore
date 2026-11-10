@@ -218,3 +218,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+#  Projeto: busca exaustiva paralela (Programação Paralela - Marco 2)
+# ---------------------------------------------------------------------------
+# Binários compilados (gerados por `make`)
+bin/
+
+# Pré-visualizações temporárias dos gráficos
+.preview/
+
+# Dados brutos de medição: versionados de propósito (dados/bruto.csv e
+# dados/resultados.csv NÃO são ignorados — a reprodutibilidade exige que a
+# medição acompanhe o texto do README).
+
+# Sistema operacional
+.DS_Store
+Thumbs.db

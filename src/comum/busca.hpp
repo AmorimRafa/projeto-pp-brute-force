@@ -1,24 +1,30 @@
 // ============================================================================
-//  busca.hpp — Núcleo comum às versões paralelas
-//  Projeto: busca exaustiva de pré-imagem de hash (Problema 9)
-//  Disciplina: Programação Paralela (CCO085) — 2026/2
+//  busca.hpp — código comum às versões OpenMP e MPI
+//  Problema 9 — Busca exaustiva (força bruta)
+//  Programação Paralela (CCO085) — 2026/2
 //
-//  Este arquivo concentra o que precisa ser IDÊNTICO nas versões sequencial,
-//  OpenMP e MPI:
+//  Aqui está apenas o que precisa ser IDÊNTICO nas três versões:
+//    1. a função de hash (cópia fiel da função h() do baseline do professor);
+//    2. o cálculo do alvo: alvo = hash(ESPACO / 3);
+//    3. a leitura dos argumentos e a impressão do resultado.
 //
-//    1. a função de hash (mesma lógica do baseline do professor);
-//    2. o cálculo do alvo (alvo = hash(ESPACO / 3));
-//    3. a leitura dos argumentos de linha de comando;
-//    4. a impressão do resultado em um formato único, fácil de medir.
+//  O arquivo docs/baseline_sequencial.cpp NÃO é alterado: ele é compilado à
+//  parte e serve de gabarito. Esta versão só repete a mesma lógica de cálculo.
 //
-//  A lógica de cálculo do baseline NÃO foi alterada: `hash_chave` reproduz
-//  exatamente as operações de `h()` em docs/baseline_sequencial.cpp. O próprio
-//  baseline é compilado separadamente (sem alterações) para servir de gabarito.
+//  COMO LER ESTE ARQUIVO (para quem está começando):
+//    1. veja `hash_chave` — a "máquina de misturar números" copiada do baseline;
+//    2. veja `ler_argumentos` — transforma a linha de comando na struct cfg;
+//    3. veja `imprimir_resultado` — a linha única que todos os scripts leem.
+//  O guia completo, com exemplos, está em docs/GUIA_INICIANTE.md.
 // ============================================================================
+
+// Estas duas linhas formam o "include guard": na 1ª vez, BUSCA_HPP não existe,
+// então o arquivo é lido e a macro é definida. Se outro arquivo incluir este
+// mesmo cabeçalho de novo, a definição já existe e o conteúdo é pulado.
+// Sem isso, as funções seriam declaradas duas vezes e o compilador reclamaria.
 #ifndef BUSCA_HPP
 #define BUSCA_HPP
 
-#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
@@ -26,153 +32,94 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <string>
 
 namespace busca {
 
-// Sentinela usado quando nenhuma chave satisfaz o alvo. É o maior uint64_t
-// possível, então `min` funciona como "melhor resultado até agora" sem casos
-// especiais. Na impressão ele vira -1, igual ao baseline.
+// Valor "sentinela": o maior uint64_t que existe.
+// `~` inverte todos os bits: ~0 vira 1111...1111, ou seja, 2^64 - 1.
+// Como queremos a MENOR chave, esse valor nunca pode ser uma resposta real.
+// Ele funciona como "ainda não achei" sem precisar de um caso especial, e na
+// impressão vira -1 (igual ao baseline quando ESPACO = 0, que não tem solução).
+// `constexpr` = "esse valor pode ser resolvido enquanto o programa compila".
 constexpr uint64_t NAO_ENCONTRADO = ~uint64_t{0};
 
-// ----------------------------------------------------------------------------
-//  Tempo
-// ----------------------------------------------------------------------------
-//  steady_clock é monotônico: não sofre ajustes do relógio do sistema durante a
-//  medição (diferente de system_clock). O baseline usa clock_gettime com
-//  CLOCK_MONOTONIC; a semântica é a mesma.
+// Relógio monotônico: só anda para frente. Não sofre ajuste de horário nem
+// de fuso durante a medição — mesma ideia do CLOCK_MONOTONIC do baseline.
+// `steady_clock::now()` devolve o instante atual; `time_since_epoch()` diz
+// quanto tempo passou desde o "zero" do relógio; `duration<double>` converte
+// isso para segundos com casa decimal (por isso o retorno é `double`).
+// `inline` permite que esta função exista no cabeçalho sem erro de link,
+// mesmo sendo incluída por openmp.cpp e mpi.cpp ao mesmo tempo.
 inline double agora() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
 }
 
 // ----------------------------------------------------------------------------
-//  Hash — CÓPIA FIEL da função h() do baseline
+//  Hash — mesma função do baseline
 // ----------------------------------------------------------------------------
-//  É o finalizador do MurmurHash3 (fmix64). Cada etapa é invertível:
-//    - x ^= x >> 33 é uma bijeção (pode ser desfeita bit a bit);
-//    - multiplicar por uma constante ímpar módulo 2^64 é uma bijeção.
-//  Logo `hash_chave` é bijetora: para cada alvo existe UMA única chave.
-//  Isso é usado na validação (basta comparar a chave encontrada) e justifica
-//  por que o término antecipado pode ser aplicado sem risco de "perder" uma
-//  ocorrência anterior.
+//  Cada chamada executa SEMPRE as mesmas operações (3 XORs e 2 multiplicações),
+//  qualquer que seja o valor de k. Não há leitura de vetor, memcpy nem ramo
+//  dependente dos dados. Portanto:
+//
+//    * o custo por chave é CONSTANTE;
+//    * a carga de trabalho é naturalmente equilibrada entre threads/processos;
+//    * NÃO há carga desigual que justifique comparar static/dynamic/guided.
+//      O enunciado só pede esse estudo "quando o problema tiver carga desigual".
+//
+//  As operações são invertíveis, logo a função é bijetora: para cada alvo
+//  existe uma única chave. Isso permite validar comparando apenas a chave.
+//
+//  Para quem não conhece os operadores, as 3 linhas abaixo são assim:
+//    k ^= k >> 33   -> desloca 33 bits para a direita e mistura com XOR (`^`).
+//                      É como "dobrar o papel e esfregar as duas metades".
+//    k *= constante -> multiplica por um número esquisito. O estouro do
+//                      uint64_t é INTENCIONAL: ele ajuda a embaralhar os bits.
+//  Repete-se o par duas vezes e faz-se um último XOR: é o "finalizador" do
+//  MurmurHash3. As constantes foram copiadas do baseline — não são inventadas.
 inline uint64_t hash_chave(uint64_t k) {
     k ^= k >> 33; k *= 0xff51afd7ed558ccdULL;
     k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL;
     k ^= k >> 33; return k;
 }
 
-// ----------------------------------------------------------------------------
-//  Política de escalonamento (OpenMP) e modo de decomposição (MPI)
-// ----------------------------------------------------------------------------
-enum class Politica { Ciclica, Estatica, Dinamica, Guiada };
-
-inline const char* nome_politica(Politica p) {
-    switch (p) {
-        case Politica::Ciclica:  return "ciclica";
-        case Politica::Estatica: return "estatica";
-        case Politica::Dinamica: return "dinamica";
-        case Politica::Guiada:   return "guiada";
-    }
-    return "desconhecida";
-}
-
-// ----------------------------------------------------------------------------
-//  Configuração compartilhada
-// ----------------------------------------------------------------------------
+// Configuração mínima: só o que as versões paralelas realmente usam.
+// `struct` é um "pacote" de variáveis com nome. Em vez de passar 4 parâmetros
+// separados para cada função, passamos um único `Configuracao`.
 struct Configuracao {
-    // Entrada (mesma convenção do baseline: 1º argumento posicional = ESPACO).
-    uint64_t espaco = 60000000ULL;
-
-    // Granularidade de trabalho.
-    //  - OpenMP: tamanho do bloco de chaves.
-    //  - MPI: tamanho MÍNIMO de bloco (o mestre aumenta conforme P).
-    uint64_t bloco = 16384;
-    bool bloco_definido = false;
-
-    // OpenMP.
-    int threads = 0;  // 0 = usar o padrão do ambiente (omp_get_max_threads)
-
-    // Modo de varredura:
-    //  - termino_antecipado = true  -> para na primeira ocorrência (baseline).
-    //  - termino_antecipado = false -> varre todo o espaço ("--completo").
-    bool termino_antecipado = true;
-
-    Politica politica = Politica::Ciclica;
-
-    // MPI: "mestre-escravo" (padrão) ou "estatico".
-    std::string modo_mpi = "mestre-escravo";
-
-    // MPI: a cada quantas chaves o modo estático verifica a mensagem de parada.
-    uint64_t intervalo = 65536;
-
-    // Derivado em ler_argumentos(): alvo = hash(espaco / 3).
-    uint64_t alvo = 0;
-
+    uint64_t espaco = 60000000ULL;  // 1º argumento, como no baseline
+    uint64_t alvo = 0;              // calculado em ler_argumentos()
+    int threads = 0;                // 0 = usar o padrão do ambiente (OpenMP)
     bool ajuda = false;
 };
 
-// ----------------------------------------------------------------------------
-//  Aritmética segura de blocos
-// ----------------------------------------------------------------------------
-//  Evita overflow quando o fim do bloco passaria de 2^64 (entradas gigantes).
-inline uint64_t fim_do_bloco(uint64_t inicio, uint64_t bloco, uint64_t espaco) {
-    return (espaco - inicio < bloco) ? espaco : inicio + bloco;
-}
-
-inline uint64_t contar_blocos(uint64_t espaco, uint64_t bloco) {
-    return espaco / bloco + (espaco % bloco != 0 ? 1 : 0);
-}
-
-// ----------------------------------------------------------------------------
-//  Impressão de ajuda
-// ----------------------------------------------------------------------------
 inline void imprimir_ajuda(const char* programa) {
     std::printf(
         "Uso: %s [ESPACO] [opcoes]\n"
         "\n"
-        "  ESPACO                 tamanho do espaco de busca (padrao: 60000000)\n"
-        "                         alvo = hash(ESPACO / 3), como no baseline\n"
+        "  ESPACO              tamanho do espaco de busca (padrao: 60000000)\n"
+        "                      alvo = hash(ESPACO / 3), como no baseline\n"
+        "  --threads=N         numero de threads (so na versao OpenMP)\n"
+        "  --ajuda             mostra esta mensagem\n"
         "\n"
-        "  --threads=N            numero de threads (OpenMP; 0 = padrao)\n"
-        "  --politica=NOME        ciclica | estatica | dinamica | guiada\n"
-        "                         (estatica/guiada so no modo --completo)\n"
-        "  --modo=NOME            mestre-escravo | estatico (MPI)\n"
-        "  --bloco=N              chaves por bloco (OpenMP) / bloco minimo (MPI)\n"
-        "  --intervalo=N          chaves entre checagens de parada (MPI estatico)\n"
-        "  --completo             varre todo o espaco em vez de parar no 1o acerto\n"
-        "  --ajuda                mostra esta mensagem\n"
-        "\n"
-        "Saida (uma linha, formato chave=valor):\n"
-        "  versao politica modo espaco alvo chave threads processos\n"
-        "  tempo_busca tempo_total mensagens\n"
-        "\n"
-        "Exemplos:\n"
-        "  %s 60000000\n"
-        "  %s 60000000 --threads=8 --politica=ciclica\n"
-        "  mpirun -np 4 %s 60000000 --modo=estatico\n",
-        programa, programa, programa, programa);
+        "Saida (uma linha):\n"
+        "  versao espaco alvo chave threads processos tempo_busca mensagens\n",
+        programa);
 }
 
-// ----------------------------------------------------------------------------
-//  Leitura de argumentos
-// ----------------------------------------------------------------------------
-//  Aceita tanto `--opcao=valor` quanto `--opcao valor`. Qualquer argumento que
-//  não comece com '-' é tratado como ESPACO (apenas o primeiro).
+// Aceita "ESPACO" posicional e "--threads=N" (ou "--threads N").
+//
+// O sistema operacional entrega `argc` (quantos pedaços têm a linha de comando)
+// e `argv` (os pedaços, como um vetor de textos). Exemplo:
+//   ./bin/openmp 60000000 --threads=4
+//   argc = 3 ; argv[0] = "./bin/openmp", argv[1] = "60000000", argv[2] = "--threads=4"
+// Não é necessário decorar: basta saber que este laço `for (i = 1; ...)` percorre
+// os argumentos e preenche a struct `cfg`.
+//
+// O `&` em `Configuracao& cfg` é uma REFERÊNCIA: a função altera a variável
+// original que está no `main`, e não uma cópia.
 inline bool ler_argumentos(int argc, char** argv, Configuracao& cfg) {
     bool espaco_definido = false;
-
-    // Devolve o valor de uma opção com '=' ou consome o próximo argumento.
-    auto valor_de = [&](int& i, const char* nome) -> const char* {
-        const char* arg = argv[i];
-        const char* igual = std::strchr(arg, '=');
-        if (igual != nullptr) return igual + 1;
-        if (i + 1 >= argc) {
-            std::fprintf(stderr, "ERRO: a opcao %s exige um valor.\n", nome);
-            return nullptr;
-        }
-        return argv[++i];
-    };
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -181,91 +128,42 @@ inline bool ler_argumentos(int argc, char** argv, Configuracao& cfg) {
             cfg.ajuda = true;
             return true;
         }
-        if (std::strcmp(arg, "--completo") == 0) {
-            cfg.termino_antecipado = false;
-            continue;
-        }
+
         if (arg[0] != '-') {
             if (espaco_definido) {
-                std::fprintf(stderr, "ERRO: ESPACO foi informado mais de uma vez ('%s').\n", arg);
+                std::fprintf(stderr, "ERRO: ESPACO informado mais de uma vez.\n");
                 return false;
             }
             char* fim = nullptr;
             errno = 0;
-            unsigned long long v = std::strtoull(arg, &fim, 10);
+            unsigned long long valor = std::strtoull(arg, &fim, 10);
             if (errno != 0 || fim == arg || *fim != '\0') {
                 std::fprintf(stderr, "ERRO: ESPACO invalido: '%s'.\n", arg);
                 return false;
             }
-            cfg.espaco = static_cast<uint64_t>(v);
+            cfg.espaco = static_cast<uint64_t>(valor);
             espaco_definido = true;
             continue;
         }
 
-        // Opções com valor.
-        auto comeca_com = [&](const char* prefixo) {
-            return std::strncmp(arg, prefixo, std::strlen(prefixo)) == 0;
-        };
-
-        if (comeca_com("--threads")) {
-            const char* v = valor_de(i, "--threads");
-            if (v == nullptr) return false;
+        if (std::strncmp(arg, "--threads", 9) == 0) {
+            // Aceita os dois formatos: "--threads=4" e "--threads 4".
+            // A expressão `condicao ? sim : nao` é um `if` em uma linha só.
+            // `nullptr` quer dizer "não aponta para nada" (não veio valor).
+            const char* igual = std::strchr(arg, '=');
+            const char* valor = igual ? igual + 1
+                                      : (i + 1 < argc ? argv[++i] : nullptr);
+            if (valor == nullptr) {
+                std::fprintf(stderr, "ERRO: --threads exige um valor.\n");
+                return false;
+            }
             char* fim = nullptr;
-            long n = std::strtol(v, &fim, 10);
-            if (fim == v || *fim != '\0' || n < 0 || n > 1024) {
-                std::fprintf(stderr, "ERRO: --threads invalido: '%s'.\n", v);
+            long n = std::strtol(valor, &fim, 10);
+            if (fim == valor || *fim != '\0' || n < 0 || n > 1024) {
+                std::fprintf(stderr, "ERRO: --threads invalido: '%s'.\n", valor);
                 return false;
             }
             cfg.threads = static_cast<int>(n);
-            continue;
-        }
-        if (comeca_com("--politica")) {
-            const char* v = valor_de(i, "--politica");
-            if (v == nullptr) return false;
-            if (std::strcmp(v, "ciclica") == 0)       cfg.politica = Politica::Ciclica;
-            else if (std::strcmp(v, "estatica") == 0) cfg.politica = Politica::Estatica;
-            else if (std::strcmp(v, "dinamica") == 0) cfg.politica = Politica::Dinamica;
-            else if (std::strcmp(v, "guiada") == 0)   cfg.politica = Politica::Guiada;
-            else {
-                std::fprintf(stderr, "ERRO: --politica desconhecida: '%s'.\n", v);
-                return false;
-            }
-            continue;
-        }
-        if (comeca_com("--modo")) {
-            const char* v = valor_de(i, "--modo");
-            if (v == nullptr) return false;
-            if (std::strcmp(v, "mestre-escravo") != 0 &&
-                std::strcmp(v, "estatico") != 0) {
-                std::fprintf(stderr, "ERRO: --modo desconhecido: '%s'.\n", v);
-                return false;
-            }
-            cfg.modo_mpi = v;
-            continue;
-        }
-        if (comeca_com("--bloco")) {
-            const char* v = valor_de(i, "--bloco");
-            if (v == nullptr) return false;
-            char* fim = nullptr;
-            unsigned long long b = std::strtoull(v, &fim, 10);
-            if (fim == v || *fim != '\0' || b == 0) {
-                std::fprintf(stderr, "ERRO: --bloco invalido: '%s'.\n", v);
-                return false;
-            }
-            cfg.bloco = static_cast<uint64_t>(b);
-            cfg.bloco_definido = true;
-            continue;
-        }
-        if (comeca_com("--intervalo")) {
-            const char* v = valor_de(i, "--intervalo");
-            if (v == nullptr) return false;
-            char* fim = nullptr;
-            unsigned long long n = std::strtoull(v, &fim, 10);
-            if (fim == v || *fim != '\0' || n < 1024) {
-                std::fprintf(stderr, "ERRO: --intervalo invalido (minimo 1024): '%s'.\n", v);
-                return false;
-            }
-            cfg.intervalo = static_cast<uint64_t>(n);
             continue;
         }
 
@@ -273,44 +171,40 @@ inline bool ler_argumentos(int argc, char** argv, Configuracao& cfg) {
         return false;
     }
 
-    // Mesma regra do baseline: alvo = h(ESPACO / 3). Não alterar.
+    // Mesma regra do baseline: sempre existe solução dentro do espaço.
     cfg.alvo = hash_chave(cfg.espaco / 3);
     return true;
 }
 
-// ----------------------------------------------------------------------------
-//  Saída padronizada
-// ----------------------------------------------------------------------------
-//  Uma única linha, com rótulos. Os scripts de coleta/validação extraem os
-//  campos por nome (por exemplo, `sed -n 's/.*chave=\([-0-9]*\).*/\1/p'`).
-//  `tempo_busca` mede apenas a região de busca (comparável ao baseline);
-//  `tempo_total` inclui inicialização, leitura de argumentos e impressão.
+// Tudo o que queremos contar sobre uma execução, num único pacote.
 struct Resultado {
     const char* versao;
-    const char* politica;
-    const char* modo;
     uint64_t espaco;
     uint64_t alvo;
     uint64_t chave;
     int threads;
     int processos;
-    double tempo_busca;
-    double tempo_total;
-    double tempo_coletivas;  // MPI: tempo em Bcast/Allreduce/Reduce
-    long long mensagens;
+    double tempo_busca;   // apenas a região de busca (comparável ao baseline)
+    long long mensagens;  // MPI: mensagens ponto a ponto; OpenMP: 0
 };
 
+// Uma única linha de saída, com campos nomeados (`chave=...`, `tempo=...`).
+// Os scripts leem pelo NOME do campo, então a ordem não importa.
+// `%` dentro da string do printf marca onde uma variável entra no texto.
+// `PRIu64` é o código certo para imprimir um `uint64_t` (ele muda de nome
+// entre Windows e Linux; por isso não usamos um `%llu` escrito na mão).
 inline void imprimir_resultado(const Resultado& r) {
-    long long chave_impressa =
-        (r.chave == NAO_ENCONTRADO) ? -1LL : static_cast<long long>(r.chave);
-
+    // O sentinela interno (2^64-1) aparece para o usuário como -1.
+    // `static_cast<long long>(...)` só avisa ao compilador que queremos
+    // explicitamente converter o tipo para imprimir.
+    long long chave_impressa = (r.chave == NAO_ENCONTRADO)
+                                   ? -1LL
+                                   : static_cast<long long>(r.chave);
     std::printf(
-        "versao=%s politica=%s modo=%s espaco=%" PRIu64 " alvo=%" PRIu64
-        " chave=%lld threads=%d processos=%d tempo_busca=%.6f tempo_total=%.6f"
-        " tempo_coletivas=%.6f mensagens=%lld\n",
-        r.versao, r.politica, r.modo, r.espaco, r.alvo, chave_impressa,
-        r.threads, r.processos, r.tempo_busca, r.tempo_total,
-        r.tempo_coletivas, r.mensagens);
+        "versao=%s espaco=%" PRIu64 " alvo=%" PRIu64 " chave=%lld"
+        " threads=%d processos=%d tempo_busca=%.6f mensagens=%lld\n",
+        r.versao, r.espaco, r.alvo, chave_impressa, r.threads, r.processos,
+        r.tempo_busca, r.mensagens);
 }
 
 }  // namespace busca

@@ -1,45 +1,38 @@
 // ============================================================================
-//  openmp.cpp — Busca exaustiva paralela com OpenMP
-//  Problema 9 — Programação Paralela (CCO085) — 2026/2
+//  openmp.cpp — versão de memória compartilhada
+//  Problema 9 — Busca exaustiva (força bruta)
+//  Programação Paralela (CCO085) — 2026/2
 //
 //  ESTRATÉGIA
-//  ----------
-//  O baseline varre k = 0, 1, 2, ... e para na primeira chave cujo hash é o
-//  alvo. Paralelizar "do jeito óbvio" (um bloco contíguo por thread) é ruim
-//  neste problema por causa do término antecipado: a thread que contém
-//  ESPACO/3 começa perto do alvo, as outras terminam antes e ficam ociosas.
+//  ---------
+//  O baseline varre k = 0, 1, 2, ... e para no primeiro acerto. Aqui o espaço
+//  é dividido em BLOCOS PEQUENOS e cada bloco é entregue a uma thread sob
+//  demanda (schedule(dynamic, 1)). Assim todas as threads avançam "lado a
+//  lado" e a parada antecipada não deixa ninguém preso num trecho gigante.
 //
-//  Aqui a distribuição principal é CÍCLICA EM BLOCOS PEQUENOS:
+//  CONDIÇÃO DE CORRIDA — decisões explícitas (pedido do enunciado)
+//  ---------------------------------------------------------------
+//  * `parar` é std::atomic<bool>: uma thread escreve, todas leem. Sem atomic
+//    haveria corrida. Foi escolhido atomic (e não critical) porque é só um
+//    booleano e a leitura acontece no início de cada bloco, não a cada chave.
+//  * `melhor_local` é variável de pilha, privada de cada thread. No fim, cada
+//    thread entra UMA vez em `#pragma omp critical` para fundir seu resultado
+//    no global. Critical a cada chave seria um gargalo.
+//  * `reduction(min:)` NÃO foi usada: ela exige que o laço termine sempre, e
+//    aqui nós saímos cedo quando encontramos a chave.
+//  * Não existe vetor compartilhado escrito pelas threads; portanto não há
+//    FALSE SHARING (duas threads disputando a mesma linha de cache).
 //
-//      thread 0: bloco 0, bloco T, bloco 2T, ...
-//      thread 1: bloco 1, bloco T+1, bloco 2T+1, ...
-//
-//  Todas as threads caminham "lado a lado" pelo espaço; quando uma encontra a
-//  chave, as demais estão a no máximo alguns milhares de chaves de distância.
-//  Isso mantém o custo por thread equilibrado e o speedup próximo de T.
-//
-//  CONDIÇÃO DE CORRIDA E ESCOLHA DAS PRIMITIVAS
-//  --------------------------------------------
-//  - `parar` (std::atomic<bool>): é escrito por uma thread quando ela encontra
-//    a chave e lido por todas as outras. `atomic` evita a corrida com o menor
-//    custo possível para um booleano. A leitura é feita a cada 1024 chaves,
-//    não a cada chave, para não gerar tráfego de coerência de cache no laço
-//    quente (o hash é o que domina o tempo).
-//  - `#pragma omp critical`: usado UMA vez por thread, no final, para fundir o
-//    melhor resultado local no resultado global. Crítico a cada iteração seria
-//    um gargalo; `atomic` também seria desnecessário para uma operação que
-//    acontece O(T) vezes.
-//  - `reduction(min:)`: usado no modo `--completo`, em que NÃO há parada
-//    antecipada. É a forma correta e mais rápida: o compilador mantém uma
-//    cópia privada por thread e combina no final, sem seção crítica.
-//    `reduction` não pode ser combinada com `break`/parada antecipada, por
-//    isso os dois modos têm laços separados.
-//  - As variáveis do laço são locais de cada thread (pilha), então não há
-//    escrita compartilhada no caminho quente e não há false sharing.
+//  LEITURA GUIADA (exemplo comentado em docs/GUIA_INICIANTE.md):
+//    1. `main` prepara a configuração e liga o cronômetro;
+//    2. `#pragma omp parallel` cria a equipe de threads;
+//    3. `#pragma omp for schedule(dynamic,1)` entrega blocos sob demanda;
+//    4. o laço interno chama o hash — idêntico ao baseline;
+//    5. `atomic` + `critical` resolvem a condição de corrida;
+//    6. `imprimir_resultado` gera a linha que os scripts leem.
 // ============================================================================
 #include <omp.h>
 
-#include <algorithm>
 #include <atomic>
 #include <cstdio>
 
@@ -49,43 +42,18 @@ using namespace busca;
 
 namespace {
 
-// Traduz a política escolhida para a API de escalonamento em tempo de execução
-// do OpenMP (`schedule(runtime)`). Assim o corpo do laço é escrito uma vez só.
-struct PlanoEscalonamento {
-    omp_sched_t tipo;
-    int pedaco;
-};
+// Bloco de 16.384 chaves: pequeno o bastante para balancear o término
+// antecipado e grande o bastante para a checagem da flag não dominar o tempo.
+constexpr uint64_t BLOCO = 16384;
 
-PlanoEscalonamento planejar(Politica politica, long long total_blocos, int threads) {
-    switch (politica) {
-        case Politica::Ciclica:
-            // Round-robin de blocos: 1 bloco por vez para cada thread.
-            return {omp_sched_static, 1};
-
-        case Politica::Estatica: {
-            // Um intervalo contíguo de blocos por thread (equivale ao
-            // `schedule(static)` clássico). Só é permitido no modo completo.
-            long long pedaco = (total_blocos + threads - 1) / threads;
-            if (pedaco < 1) pedaco = 1;
-            return {omp_sched_static, static_cast<int>(pedaco)};
-        }
-
-        case Politica::Dinamica:
-            // Cada bloco é entregue sob demanda: bom quando o custo varia.
-            return {omp_sched_dynamic, 1};
-
-        case Politica::Guiada:
-            // Blocos grandes no início, menores no fim.
-            return {omp_sched_guided, 1};
-    }
-    return {omp_sched_static, 1};
+// Número de blocos, arredondando para cima sem estourar uint64_t.
+inline uint64_t total_de_blocos(uint64_t espaco) {
+    return espaco / BLOCO + (espaco % BLOCO != 0 ? 1 : 0);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    const double inicio_programa = agora();
-
     Configuracao cfg;
     if (!ler_argumentos(argc, argv, cfg)) return 2;
     if (cfg.ajuda) {
@@ -93,110 +61,95 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // No modo com término antecipado, `estatica` (bloco contíguo) e `guiada`
-    // (blocos iniciais grandes) fariam o tempo depender da posição da chave:
-    // uma thread poderia abandonar um trecho ainda não verificado. Como o hash
-    // é bijetor o resultado continuaria correto, mas a medição deixaria de ser
-    // uma comparação justa. Elas ficam restritas ao modo `--completo`.
-    if (cfg.termino_antecipado &&
-        (cfg.politica == Politica::Estatica || cfg.politica == Politica::Guiada)) {
-        std::fprintf(stderr,
-                     "ERRO: no modo com termino antecipado use --politica=ciclica "
-                     "ou --politica=dinamica.\n"
-                     "      As politicas estatica/guiada so fazem sentido com "
-                     "--completo (veja o README).\n");
-        return 2;
-    }
+    // "Não ajuste o número de threads sozinho, mantenha as N que eu pedi."
+    // Sem isso, a biblioteca poderia criar menos threads em uma repetição e
+    // a medição ficaria difícil de comparar.
+    omp_set_dynamic(0);
 
-    omp_set_dynamic(0);  // número de threads fixo: medicao reprodutível
+    // Se o usuário não passou --threads, usamos o padrão do ambiente.
+    // É o operador curto `cond ? sim : nao` de novo.
     int threads = (cfg.threads > 0) ? cfg.threads : omp_get_max_threads();
     if (threads < 1) threads = 1;
 
-    const uint64_t total_blocos64 = contar_blocos(cfg.espaco, cfg.bloco);
-    const long long total_blocos = static_cast<long long>(total_blocos64);
+    const uint64_t blocos = total_de_blocos(cfg.espaco);
+    const uint64_t alvo = cfg.alvo;
 
-    const PlanoEscalonamento plano = planejar(cfg.politica, total_blocos, threads);
-    omp_set_schedule(plano.tipo, plano.pedaco);
+    // `std::atomic<bool>` é um booleano com acesso SEGURO entre threads.
+    // Sem `atomic`, uma thread poderia escrever `true` enquanto outra lia, e
+    // o compilador poderia estar usando uma cópia antiga em cache: corrida.
+    // Aqui `false` é o valor inicial (ninguém achou nada ainda).
+    std::atomic<bool> parar{false};
 
+    // Resultado global. Só é escrito depois, dentro do `critical`.
     uint64_t melhor = NAO_ENCONTRADO;
 
-    const double inicio_busca = agora();
+    const double inicio = agora();
 
-    if (cfg.termino_antecipado) {
-        // --------------------------------------------------------------------
-        //  Modo com término antecipado: flag atômica + fusão por critical.
-        // --------------------------------------------------------------------
-        std::atomic<bool> parar{false};
-
+// `#pragma` é uma instrução ESPECIAL para o compilador: em C++ puro isso não
+// existe. Quem entende esta linha é o compilador chamado com -fopenmp.
+// `parallel` cria `threads` threads. Tudo que está entre as chaves abaixo é
+// executado por CADA uma delas; depois do `}` o programa volta a 1 thread.
 #pragma omp parallel num_threads(threads)
-        {
-            uint64_t melhor_local = NAO_ENCONTRADO;
+    {
+        // Declarada DENTRO da região parallel: cada thread ganha sua própria
+        // cópia na pilha. Ninguém mais mexe nela, então não há corrida nem
+        // false sharing aqui.
+        uint64_t melhor_local = NAO_ENCONTRADO;
 
-#pragma omp for schedule(runtime)
-            for (long long b = 0; b < total_blocos; ++b) {
-                // Blocos posteriores ao que encontrou a chave são descartados.
-                if (parar.load(std::memory_order_relaxed)) continue;
+        // Outra diretiva: ela transforma este `for` numa FILA de blocos.
+        // `dynamic, 1` = "quem terminar seu bloco, pega o próximo da fila,
+        // um de cada vez". Com `static`, cada thread receberia sua parte de
+        // uma vez só — aqui isso desperdiçaria tempo por causa da parada
+        // antecipada (a resposta fica em 1/3 do espaço).
+#pragma omp for schedule(dynamic, 1)
+        for (uint64_t b = 0; b < blocos; ++b) {
+            // Flag verificada no início do bloco. Se outra thread já achou,
+            // simplesmente pulamos. O desperdício é de no máximo um bloco.
+            // `load` = "ler"; `relaxed` = "só preciso que a leitura seja
+            // atômica, não preciso ordenar outros dados". É a opção mais
+            // barata e suficiente aqui. `continue` pula para o próximo bloco.
+            if (parar.load(std::memory_order_relaxed)) continue;
 
-                const uint64_t inicio = static_cast<uint64_t>(b) * cfg.bloco;
-                const uint64_t fim = fim_do_bloco(inicio, cfg.bloco, cfg.espaco);
+            // O último bloco pode ser menor que BLOCO; o `?:` aqui é um
+            // "mínimo" escrito na mão: fim = min(inicio + BLOCO, espaco).
+            const uint64_t inicio_bloco = b * BLOCO;
+            const uint64_t fim_bloco =
+                (cfg.espaco - inicio_bloco < BLOCO) ? cfg.espaco
+                                                    : inicio_bloco + BLOCO;
 
-                // Varre o bloco em janelas de 1024 chaves. A checagem da flag
-                // só acontece entre janelas, mantendo o laço interno compacto.
-                for (uint64_t k = inicio; k < fim;) {
-                    const uint64_t limite = (fim - k < 1024) ? fim : k + 1024;
-                    for (; k < limite; ++k) {
-                        if (hash_chave(k) == cfg.alvo) {
-                            melhor_local = k;
-                            break;
-                        }
-                    }
-                    if (melhor_local != NAO_ENCONTRADO) {
-                        parar.store(true, std::memory_order_relaxed);
-                        break;
-                    }
-                    if (parar.load(std::memory_order_relaxed)) break;
+            // O laço de verdade: testa uma chave por vez, como o baseline.
+            for (uint64_t k = inicio_bloco; k < fim_bloco; ++k) {
+                if (hash_chave(k) == alvo) {
+                    melhor_local = k;                              // guarda o achado
+                    parar.store(true, std::memory_order_relaxed);  // avisa as outras
+                    break;  // sai SÓ deste laço interno; a thread ainda
+                            // continuará no laço de blocos, mas vai pular todos.
                 }
             }
-
-            // Fusão: uma vez por thread. `local < melhor` obtém o menor índice,
-            // mantendo a semântica de "primeira ocorrência" do baseline.
-#pragma omp critical(busca_fusao)
-            {
-                if (melhor_local < melhor) melhor = melhor_local;
-            }
         }
-    } else {
-        // --------------------------------------------------------------------
-        //  Modo completo: sem parada, redução nativa de mínimo.
-        // --------------------------------------------------------------------
-        const uint64_t alvo = cfg.alvo;
 
-#pragma omp parallel for schedule(runtime) num_threads(threads) reduction(min : melhor)
-        for (long long b = 0; b < total_blocos; ++b) {
-            const uint64_t inicio = static_cast<uint64_t>(b) * cfg.bloco;
-            const uint64_t fim = fim_do_bloco(inicio, cfg.bloco, cfg.espaco);
-            for (uint64_t k = inicio; k < fim; ++k) {
-                if (hash_chave(k) == alvo && k < melhor) melhor = k;
-            }
+        // `#pragma omp critical(nome)` = "uma thread de cada vez neste trecho".
+        // Cada thread entra UMA única vez, no fim, para juntar seu resultado
+        // no global. Colocar o critical dentro do laço de chaves travaria as
+        // threads a cada iteração e destruiria o desempenho.
+        // O `<` (menor índice) reproduz a ideia de "primeira ocorrência".
+#pragma omp critical(fusao_resultado)
+        {
+            if (melhor_local < melhor) melhor = melhor_local;
         }
     }
 
-    const double fim_busca = agora();
+    const double fim = agora();
 
     Resultado r;
     r.versao = "openmp";
-    r.politica = nome_politica(cfg.politica);
-    r.modo = cfg.termino_antecipado ? "antecipado" : "completo";
     r.espaco = cfg.espaco;
     r.alvo = cfg.alvo;
     r.chave = melhor;
     r.threads = threads;
     r.processos = 1;
-    r.tempo_busca = fim_busca - inicio_busca;
-    r.tempo_total = agora() - inicio_programa;
-    r.tempo_coletivas = 0.0;
+    r.tempo_busca = fim - inicio;
     r.mensagens = 0;
     imprimir_resultado(r);
-
     return 0;
 }

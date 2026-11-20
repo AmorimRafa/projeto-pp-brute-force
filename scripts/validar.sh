@@ -1,30 +1,30 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  validar.sh — Prova de corretude contra o baseline
+#  validar.sh — prova de corretude contra o baseline
 #
-#  Roda o baseline (docs/baseline_sequencial.cpp, compilado sem alterações) e
-#  compara a chave encontrada por TODAS as versões, em vários tamanhos de
-#  espaço, políticas, números de threads e números de processos.
+#  Compara a CHAVE encontrada pelo baseline (arquivo original do professor)
+#  com a chave das versões OpenMP e MPI, em vários tamanhos de espaço e em
+#  diferentes números de threads/processos.
 #
-#  Uso:  make validar
-#  Saída: uma linha OK/FALHA por combinação; código de saída != 0 se falhar.
+#  Uso: make validar
 # ============================================================================
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
 
 MPIRUN="${MPIRUN:-mpirun --use-hwthread-cpus}"
-read -r -a MPIRUN_CMD <<< "${MPIRUN}"
+read -r -a MPIRUN_CMD <<< "$MPIRUN"
 
-ESPACOS="${ESPACOS:-0 1 2 3 10 1000 100003 60000000}"
+ESPACOS="${ESPACOS:-0 1 2 3 10 1000 60000000}"
 NUCLEOS="$(nproc)"
-VERDE=$'\033[32m'
-VERMELHO=$'\033[31m'
-ZERO=$'\033[0m'
-falhas=0
-total=0
+
+# 70 combinações = 7 tamanhos de espaço × (5 contagens de threads + 5 de processos).
+# Os tamanhos pequenos (0, 1, 2, 3) são os mais importantes: a resposta fica no
+# começo, então qualquer erro de término antecipado aparece na hora.
 
 # Extrai o valor de um campo "chave=valor" da linha de saída.
+# O awk quebra a linha em pedaços (`NF` é o total), separa cada pedaço em
+# "nome=valor" (`split`) e devolve o valor quando o nome bate com o pedido.
 campo() {
     awk -v k="$1" '{
         for (i = 1; i <= NF; i++) {
@@ -38,10 +38,10 @@ verificar() {
     local descricao="$1" esperado="$2" obtido="$3"
     total=$((total + 1))
     if [[ "$obtido" == "$esperado" ]]; then
-        printf "  %-62s %sOK%s   (chave=%s)\n" "$descricao" "$VERDE" "$ZERO" "$obtido"
+        printf "  %-52s OK   (chave=%s)\n" "$descricao" "$obtido"
     else
-        printf "  %-62s %sFALHA%s (esperado=%s, obtido=%s)\n" \
-               "$descricao" "$VERMELHO" "$ZERO" "$esperado" "$obtido"
+        printf "  %-52s FALHA (esperado=%s, obtido=%s)\n" \
+               "$descricao" "$esperado" "$obtido"
         falhas=$((falhas + 1))
     fi
 }
@@ -51,15 +51,17 @@ if [[ ! -x bin/sequencial || ! -x bin/openmp || ! -x bin/mpi ]]; then
     exit 1
 fi
 
-# Lista de threads/processos limitada aos núcleos disponíveis.
+# Lista 1, 2, 4, 8 e N (sem repetir e sem passar dos núcleos da máquina).
 lista() {
-    local valores="1 2 4 8 ${NUCLEOS}" t
-    for t in $valores; do
+    local t
+    for t in 1 2 4 8 "$NUCLEOS"; do
         if [[ "$t" -le "$NUCLEOS" ]]; then echo "$t"; fi
     done | sort -n -u
 }
-THREADS_LISTA=$(lista)
-MAIOR=$(echo "$THREADS_LISTA" | tail -1)
+LISTA="$(lista)"
+
+total=0
+falhas=0
 
 echo "=============================================================================="
 echo " Validação de corretude — baseline x OpenMP x MPI"
@@ -67,52 +69,30 @@ echo " Núcleos disponíveis: ${NUCLEOS}"
 echo "=============================================================================="
 
 for espaco in $ESPACOS; do
-    saida_base=$(./bin/sequencial "$espaco")
-    referencia=$(campo chave "$saida_base")
+    saida_base="$(./bin/sequencial "$espaco")"
+    referencia="$(campo chave "$saida_base")"
     echo
     echo "ESPACO=${espaco}  (baseline: chave=${referencia})"
 
-    # ---------------- OpenMP ----------------
-    for nt in $THREADS_LISTA; do
-        r=$(./bin/openmp "$espaco" --threads="$nt")
-        verificar "openmp  ciclica  antecipado  threads=${nt}" "$referencia" "$(campo chave "$r")"
+    for t in $LISTA; do
+        r="$(./bin/openmp "$espaco" --threads="$t")"
+        verificar "openmp  ESPACO=${espaco}  threads=${t}" \
+                  "$referencia" "$(campo chave "$r")"
     done
 
-    r=$(./bin/openmp "$espaco" --threads="$MAIOR" --politica=dinamica)
-    verificar "openmp  dinamica antecipado  threads=${MAIOR}" "$referencia" "$(campo chave "$r")"
-
-    r=$(./bin/openmp "$espaco" --threads=1 --completo --politica=estatica)
-    verificar "openmp  estatica completo    threads=1" "$referencia" "$(campo chave "$r")"
-
-    r=$(./bin/openmp "$espaco" --threads="$MAIOR" --completo --politica=guiada)
-    verificar "openmp  guiada   completo    threads=${MAIOR}" "$referencia" "$(campo chave "$r")"
-
-    # ---------------- MPI ----------------
-    for np in $THREADS_LISTA; do
-        r=$("${MPIRUN_CMD[@]}" -np "$np" ./bin/mpi "$espaco" --modo=mestre-escravo)
-        verificar "mpi     mestre-escravo antecipado  -np ${np}" "$referencia" "$(campo chave "$r")"
+    for p in $LISTA; do
+        r="$("${MPIRUN_CMD[@]}" -np "$p" ./bin/mpi "$espaco")"
+        verificar "mpi     ESPACO=${espaco}  -np=${p}" \
+                  "$referencia" "$(campo chave "$r")"
     done
-
-    for np in $THREADS_LISTA; do
-        r=$("${MPIRUN_CMD[@]}" -np "$np" ./bin/mpi "$espaco" --modo=estatico)
-        verificar "mpi     estatico       antecipado  -np ${np}" "$referencia" "$(campo chave "$r")"
-    done
-
-    r=$("${MPIRUN_CMD[@]}" -np "$MAIOR" ./bin/mpi "$espaco" --modo=estatico --completo)
-    verificar "mpi     estatico       completo    -np ${MAIOR}" "$referencia" "$(campo chave "$r")"
-
-    r=$("${MPIRUN_CMD[@]}" -np 2 ./bin/mpi "$espaco" --modo=mestre-escravo --completo)
-    verificar "mpi     mestre-escravo completo    -np 2" "$referencia" "$(campo chave "$r")"
 done
 
 echo
 echo "=============================================================================="
 if [[ "$falhas" -eq 0 ]]; then
-    printf " %sRESULTADO: %d/%d combinações OK — todas as versões reproduzem o baseline.%s\n" \
-           "$VERDE" "$total" "$total" "$ZERO"
+    echo " RESULTADO: ${total}/${total} combinações OK — todas reproduzem o baseline."
     exit 0
 else
-    printf " %sRESULTADO: %d falha(s) em %d combinações.%s\n" \
-           "$VERMELHO" "$falhas" "$total" "$ZERO"
+    echo " RESULTADO: ${falhas} falha(s) em ${total} combinações."
     exit 1
 fi

@@ -41,7 +41,7 @@
 * `src/mpi/mpi.cpp`: mestre-escravo com tags `BLOCO`, `PEDIDO`, `RESULTADO` e
   `PARAR`.
 * Coletivas: `MPI_Bcast` e `MPI_Allreduce(MPI_MIN)`.
-* `docs/DECISAO_MPI.md`: justificativa da decomposição e do teto `(P−1)/P`.
+* `docs/ANALISE_EXPERIMENTAL.txt`: justificativa da decomposição, teto `(P−1)/P` e contas de speedup.
 * Contagem de mensagens no próprio mestre (sem `MPI_Reduce` extra).
 
 ---

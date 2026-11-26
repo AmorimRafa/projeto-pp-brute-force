@@ -15,7 +15,7 @@
 //    1. veja `hash_chave` — a "máquina de misturar números" copiada do baseline;
 //    2. veja `ler_argumentos` — transforma a linha de comando na struct cfg;
 //    3. veja `imprimir_resultado` — a linha única que todos os scripts leem.
-//  O guia completo, com exemplos, está em docs/GUIA_INICIANTE.md.
+//  Os comentários no topo de cada arquivo explicam o código linha a linha.
 // ============================================================================
 
 // Estas duas linhas formam o "include guard": na 1ª vez, BUSCA_HPP não existe,

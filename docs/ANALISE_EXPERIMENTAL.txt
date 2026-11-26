@@ -1,0 +1,672 @@
+================================================================================
+ ANALISE EXPERIMENTAL — TEMPO, SPEEDUP, EFICIENCIA E LEI DE AMDAHL
+ Problema 9 — Busca exaustiva de pre-imagem de hash (forca bruta)
+ Programacao Paralela (CCO085) — 2026/2 — Prof. Rodrigo Goncalves
+================================================================================
+
+Este arquivo documenta a analise, todos os valores vem de:
+
+    dados/bruto.csv         -> 115 execucoes (5 repeticoes por configuracao)
+    dados/perfilamento.csv  -> tempo total x tempo do laco do baseline
+    dados/resultados.csv    -> medianas, speedup e eficiencia (o que os graficos usam)
+
+Para conferir qualquer numero: `make && make dados && make graficos`.
+Nada aqui foi "estimado no olho": toda conta e mostrada passo a passo.
+
+
+--------------------------------------------------------------------------------
+ 0. RESUMO EM 30 SEGUNDOS
+--------------------------------------------------------------------------------
+
+* O problema e O(N) no tempo e O(1) na memoria: o custo esta 100% em um unico
+  laco de hash. Nao ha vetor, nao ha I/O dentro do laco.
+
+* O baseline gasta 1,357 s para N = 4,8e9 (1,18 G chaves/s). O laco e ~100% do
+  tempo nesse tamanho: e o unico hotspot, portanto e o unico lugar a paralelizar.
+
+* OpenMP (12 threads): 1,353 s -> 0,236 s  = speedup 5,74x, eficiencia 47,8%.
+
+* MPI (12 processos):  1,349 s -> 0,272 s  = speedup 4,95x, eficiencia 41,3%
+  — com o detalhe arquitetural de que so P-1 processos buscam (mestre nao busca).
+
+* Amdahl explica o teto: com a fracao serial medida no perfilamento, o speedup
+  maximo do programa inteiro e 5,57x (N=60M), 30,9x (N=480M) e praticamente
+  ilimitado (N=4,8G). O que a curva NAO alcanca em 12 threads nao e violacao de
+  Amdahl: e overhead que cresce com p, medido pela metrica de Karp-Flatt
+  (3,05% -> 9,92% no OpenMP).
+
+* A curva satura entre 8 e 12 threads porque a maquina de medicao nao tem 12
+  nucleos iguais: e um i5-1235U com 2 P-cores (com SMT) + 8 E-cores, ou seja,
+  10 nucleos e 12 threads logicas. 8 -> 12 threads rende apenas +5,7%,
+  enquanto 4 -> 8 rende +60%.
+
+
+--------------------------------------------------------------------------------
+ 1. CHECKLIST DOS REQUISITOS
+--------------------------------------------------------------------------------
+
+ 1.1 MARCO 1 (10/09/2026)
+ [x] Identificacao do trio e do problema
+     -> AUTORES.md (frentes) + README.md secao 1 (Problema 9).
+ [x] Analise do algoritmo sequencial: complexidade e o que ele faz
+     -> secao 2.1 deste arquivo.
+ [x] Perfilamento com tabela de tempo por trecho, mostrando os hotspots
+     -> secao 2.3 + dados/perfilamento.csv.
+ [x] Baseline medido em >= 3 tamanhos, com metodologia (repeticoes,
+     aquecimento, maquina)
+     -> secao 3 (e secao 2.2 com a tabela dos 3 tamanhos).
+ [x] Fracao paralelizavel estimada e speedup maximo previsto por Amdahl
+     -> secao 5.3 (f = 17,97% / 3,24% / ~0% e Smax = 5,57 / 30,9 / ~infinito).
+ [x] Plano de paralelizacao: padrao OpenMP e padrao MPI, com justificativa
+     -> secao 4.4 (resumo) + comentarios no topo de src/openmp/openmp.cpp e
+        src/mpi/mpi.cpp.
+
+ 1.2 MARCO 2 (12/11/2026)
+ [x] OpenMP funcionando, tratamento de condicao de corrida e curva de speedup
+     -> secao 6; corrida: std::atomic<bool> parar + critical so na fusao final.
+ [x] MPI funcionando, decomposicao, operacao coletiva e curva de speedup
+     -> secao 7; MPI_Bcast + MPI_Allreduce(MPI_MIN), mestre-escravo dinamico.
+ [x] Validacao de corretude contra o baseline
+     -> `make validar` = 70/70 combinacoes OK (7 espacos x 5 threads + 5
+        processos). Todas as versoes devolvem a mesma chave do baseline.
+ [x] Analise experimental: graficos de tempo/speedup/eficiencia, escalabilidade
+     forte e fraca e discussao do afastamento de Amdahl
+     -> secoes 8 e 9 + graficos/*.svg (tempo, speedup, eficiencia,
+        escalabilidade_fraca).
+ [x] Repositorio: Makefile, CSV de medicao, README que roda do zero, graficos,
+     AUTORES.md
+     -> secoes 12 e 13.
+
+ 1.3 CRITERIOS DE NOTA DO ARTEFATO (4,0 pontos — secao 8.1 do PDF)
+ [1,0] Baseline, perfilamento e estimativa de Amdahl .......... secoes 2, 3 e 5
+ [1,0] OpenMP correta, com corrida tratada e speedup medido ..... secao 6
+ [1,0] MPI correta, com decomposicao e coletiva ................. secao 7
+ [1,0] Analise experimental (graficos, escalabilidade, discussao)
+       e documentacao .......................................... secoes 8, 9, 11
+
+
+--------------------------------------------------------------------------------
+ 2. O PROBLEMA, O BASELINE E O PERFILAMENTO
+--------------------------------------------------------------------------------
+
+ 2.1 O que o codigo sequencial faz (docs/baseline_sequencial.cpp, intocado)
+
+     alvo = h(N/3);  
+     for (k = 0; k < N; k++) 
+     if (h(k) == alvo) parar;
+
+ * h(k) e um "mixing" de 64 bits: 3 multiplicacoes + 3 deslocamentos XOR.
+ * O codigo garante que EXISTE solucao: o alvo e o hash da chave N/3.
+ * Como a busca comeca em 0 e o alvo esta em N/3, o laco executa EXATAMENTE
+   N/3 + 1 iteracoes. O custo e deterministico — e por isso as 5 repeticoes
+   variam apenas ~1% (ruido do sistema), nao por causa do algoritmo.
+
+ Complexidade:  T(N) = O(N)  (constante por iteracao: ~3 imul + 3 shifts)
+ Memoria:       M(N) = O(1)  (nenhum vetor; so o contador k e o alvo)
+
+ O ponto importante: como M(N) = O(1), o programa NAO e
+ limitado por banda de memoria — ele e limitado por ALU (latencia das
+ multiplicacoes). Isso muda a discussao de Amdahl (ver secao 9.4).
+
+ 2.2 Baseline medido (mediana de 5 repeticoes, 1 de aquecimento descartada)
+
+   N (espaco)      iteracoes     tempo (s)    taxa (G chave/s)
+   ------------   ------------   ----------   ----------------
+   60.000.000       20.000.000     0,016729        1,196
+   480.000.000     160.000.000     0,134038        1,194
+   4.800.000.000  1.600.000.000    1,356594        1,179
+
+   As 5 medicoes de N = 4,8e9:
+   1,331605  1,336469  1,356594  1,363637  1,389323
+   -> mediana = 1,356594; amplitude = 4,3% (ruido de escalonamento do SO).
+   O uso da MEDIANA (e nao da media) e deliberado: um pico isolado nao puxa
+   o resultado. A media seria 1,3555 — praticamente igual aqui, mas a mediana
+   e robusta se uma medicao for interrompida pelo sistema.
+
+   Por que esses 3 tamanhos? 60M -> cabe no cache e expoe o custo fixo de
+   inicializacao (82% do tempo no laco; o resto e overhead). 480M -> o laco
+   passa a dominar (96,8%). 4,8G -> o laco e ~100% do tempo (1,18 s de busca),
+   escala ideal para medir speedup sem o custo fixo mascarar o resultado.
+
+ 2.3 Perfilamento — onde o tempo é gasto (dados/perfilamento.csv)
+
+   Metodo: mede-se o tempo TOTAL por fora (date +%s%N) e compara-se com o
+   tempo QUE O PROPRIO BASELINE IMPRIME (so o laco). A diferenca e
+   inicializacao do processo + leitura de argumentos + impressao.
+   (Foram feitas 3 medicoes e usou-se o menor valor de cada, para reduzir
+   ruido; por isso o ultimo caso deu 100,50% — ruido, nao erro.)
+
+   N            tempo total   tempo do laco   laco %    custo fixo (s)
+   ----------   -----------   -------------   ------    --------------
+   60.000.000     0,020413       0,016745      82,03%      0,003668
+   480.000.000    0,137794       0,133333      96,76%      0,004461
+   4.800.000.000  1,339528       1,346270     100,50%     ~0 (ruido)
+
+   Conclusao do perfilamento (hotspot):
+   -> o laco de busca responde por 82% a ~100% do tempo;
+   -> NAO existe segundo hotspot: nao ha I/O, nao ha alocacao, nao ha
+      estruturas de dados;
+   -> portanto a paralelizacao deve atacar SO esse laco, e todo o resto e
+      "serial por natureza" (custo fixo, ~4 ms), o que entra direto na conta
+      de Amdahl.
+
+
+--------------------------------------------------------------------------------
+ 3. PROTOCOLO DE MEDICAO (metodologia — requisito explicito do Marco 1)
+--------------------------------------------------------------------------------
+
+ * Maquina: notebook Intel Core i5-1235U (2 P-cores + 8 E-cores = 10 nucleos,
+   12 threads logicas). O container enxerga 12 CPUs logicas (reportadas como
+   6 nucleos x 2 threads de SMT).
+   Sistema: Ubuntu 24.04 em container Docker (Windows 11 / Docker Desktop).
+   g++ 13.3.0, Open MPI 4.1.6, Python 3.12.3.
+ * Repeticoes: 1 execucao de aquecimento (descartada) + 5 validas.
+ * Agregacao: MEDIANA das 5 (a media tambem esta no CSV: tempo_minimo e
+   tempo_maximo mostram a dispersao).
+ * Cronometro: clock_gettime(CLOCK_MONOTONIC) dentro do programa, para nao
+   medir o startup do processo. O perfilamento do baseline (secao 2.3) usa o
+   tempo externo de proposito, porque ali o custo fixo E o objeto de estudo.
+ * MPI: mpirun --use-hwthread-cpus (permite -np ate o numero de CPUs logicas,
+   nao apenas fisicas). -np vai de 1 ate nproc = 12.
+ * OpenMP: omp_set_dynamic(0) para garantir que o numero de threads pedido em
+   --threads seja realmente usado.
+ * Tamanho da entrada: fixo durante a curva de speedup (escalabilidade forte);
+   na escalabilidade fraca, N cresce proporcionalmente as unidades.
+
+ Aviso honesto: as medicoes do repositorio foram feitas
+ com a maquina ociosa. Rodando de novo com o navegador/Docker ocupados, o
+ mesmo binario chega a ficar 3x mais lento.
+
+
+--------------------------------------------------------------------------------
+ 4. FORMULARIO — TODAS AS FORMULAS
+--------------------------------------------------------------------------------
+
+ 4.1 Tempo e speedup
+
+     T(1) = tempo com 1 thread/processo (mesma entrada N)
+     T(p) = tempo com p threads/processos
+     S(p) = T(1) / T(p)                    (speedup)
+
+ 4.2 Eficiencia
+
+     E(p) = S(p) / p                        (0 a 1; em % basta multiplicar por 100)
+
+     Interpretacao: quanto de cada unidade paralela esta sendo aproveitada.
+     E = 1 (100%) significa aceleracao perfeitamente linear.
+
+ 4.3 Custo e custo otimo
+
+     C(p) = p * T(p)
+     E(p) = T(1) / C(p)
+     E = 100% <-> C(p) = T(1) <-> custo constante (custo otimo).
+
+ 4.4 Escalabilidade FORTE (entrada fixa, mais unidades)
+
+     N fixo; S(p) = T(1)/T(p); E(p) = S(p)/p.
+     Responde: "com o mesmo trabalho, quanto mais rapido fica?"
+     -> e o que esta em dados/resultados.csv com escala = forte.
+
+ 4.5 Escalabilidade FRACA (trabalho POR UNIDADE constante)
+
+     N cresce junto com p: N(p) = N_base * p  (OpenMP)
+     No MPI mestre-escravo, quem trabalha e P-1, entao N(p) = N_base * (P-1).
+
+     Metrica usual: tempo se mantem constante  -> E_fraca(p) = T_base / T(p)
+     Speedup escalado (Lei de Gustafson):       S'(p) = p * T_base / T(p)
+     (para o MPI, trocar p por p-1 em S').
+
+     Nota: por isso as linhas de escala fraca em dados/resultados.csv nao tem
+     coluna speedup preenchida — o speedup "classico" so faz sentido com N fixo.
+     A conta correta esta na secao 8.
+
+ 4.6 Lei de Amdahl (deducao, para escrever no quadro)
+
+     Seja f a fracao do tempo sequencial que NAO pode ser paralelizada
+     (0 <= f <= 1). Com p unidades:
+
+        T(p) = f * T(1)  +  (1 - f) * T(1) / p
+               \_______/     \_____________/
+               parte serial   parte paralela dividida por p
+
+        S(p) = T(1) / T(p) = 1 / (f + (1 - f) / p)
+
+     Limite quando p -> infinito:
+
+        S_max = 1 / f
+
+     Consequencias:
+     * f = 0    -> S(p) = p        (linear; so existe no papel)
+     * f = 5%   -> S_max = 20x     (mesmo com infinitos nucleos)
+     * f = 10%  -> S_max = 10x
+     * f = 17,97% -> S_max = 5,57x
+
+     Amdahl olha para o problema de tamanho FIXO. Por isso ele "pune" a
+     paralelizacao: a parte serial nao diminui quando p cresce.
+
+ 4.7 Lei de Gustafson (o contraponto: problema que cresce)
+
+        S'(p) = f + p * (1 - f)
+
+     Se o problema crescer junto com a maquina, o termo serial fica
+     diluido e o speedup pode crescer quase linearmente. e a base teorica
+     da escalabilidade FRACA (secao 8). Amdahl e Gustafson nao se
+     contradizem: respondem perguntas diferentes ("mesmo problema" x
+     "problema maior no mesmo tempo").
+
+ 4.8 Metrica de Karp-Flatt (mede a "fracao serial efetiva" dos dados)
+
+        e(p) = ( 1/S(p) - 1/p ) / ( 1 - 1/p )
+
+     Serve para testar se o modelo de Amdahl com f CONSTANTE descreve os
+     dados. Se e(p) cresce com p, o que atrapalha nao e uma parte serial
+     fixa: e overhead que aumenta com p (comunicacao, contencao, espera).
+     Se e(p) fosse constante e igual a f, Amdahl explicaria tudo.
+
+ 4.9 Limite arquitetural do MPI mestre-escravo
+
+     O rank 0 so coordena; quem busca sao P-1 processos. Logo:
+
+        S_max(P) = P - 1            (ex.: P=12 -> no maximo 11x)
+        E_max(P) = (P - 1) / P      (ex.: P=12 -> 91,7%)
+
+     E por isso que a eficiencia do MPI deve ser lida tambem como
+     S(P)/(P-1): a "culpa" de nao chegar a 100% e, em parte, do modelo.
+
+
+--------------------------------------------------------------------------------
+ 5. LEI DE AMDAHL APLICADA A ESTE PROJETO
+--------------------------------------------------------------------------------
+
+ 5.1 Tabela pronta (S(p) para varios f) — boa para mostrar no quadro
+
+     f \ p      2       4       8      12      20      infinito
+     -----   -----   -----   -----   -----   -----   ---------
+     1%       1,98    3,88    7,48   10,81   16,81      100,0
+     2%       1,96    3,77    7,02    9,84   14,49       50,0
+     3,24%    1,94    3,65    6,52    8,85   12,38       30,9
+     5%       1,90    3,48    5,93    7,74   10,26       20,0
+     10%      1,82    3,08    4,71    5,71    6,90       10,0
+     17,97%   1,70    2,60    3,54    4,03    4,53        5,6
+     20%      1,67    2,50    3,33    3,75    4,17        5,0
+
+ 5.2 Fracao serial medida (f) e speedup maximo previsto
+
+     f = 1 - (tempo do laco / tempo total)   [secao 2.3]
+
+     N = 60M:  f = 1 - 0,8203 = 17,97%  -> S_max = 1/0,1797 = 5,57x
+     N = 480M: f = 1 - 0,9676 =  3,24%  -> S_max = 1/0,0324 = 30,9x
+     N = 4,8G: f = 1 - 1,0050 ~=  0%    -> S_max ~= ilimitado (custo fixo ~4ms
+                                                 em 1,35 s = 0,3%)
+
+     Leitura: quanto MENOR a entrada, mais Amdahl morde — porque o custo fixo
+     (inicializacao + parsing + impressao, ~4 ms) fica grande em relacao ao
+     laco. Em N = 60M o laco dura 16,7 ms; 3,7 ms de custo fixo = 18,0% do total.
+
+     Exemplo com todas as contas (N = 60M, p = 12):
+       S(12) = 1 / (0,1797 + 0,8203/12)
+             = 1 / (0,1797 + 0,068358)
+             = 1 / 0,248058
+             = 4,031x
+       E(12) = 4,031 / 12 = 33,6%
+
+ 5.3 Sutilezas
+
+     O speedup reportado no CSV/graficos usa o tempo INTERNO (tempo_busca),
+     que comeca DEPOIS do parsing e mede SO a regiao paralela. Nessa regiao
+     nao existe codigo serial "de verdade": o limite de Amdahl para ela e p
+     (12x), e nao 5,57x. Portanto:
+
+       * S_max = 5,57x (N=60M) vale para o PROGRAMA INTEIRO, cronometrado
+         por fora (e o numero que responde ao Marco 1);
+       * os S medidos (5,74x em 12 threads) valem para o TRECHO PARALELO e
+         devem ser comparados com o limite p = 12.
+
+     Se alguem perguntar "como voce tem 5,74x se Amdahl previa 5,57x?",
+     a resposta e: sao relogios diferentes — e ainda por cima N diferente
+     (o 5,57 e para N=60M; o 5,74 e para N=4,8G, onde f ~ 0).
+
+     Comparacao honesta em N = 4,8G, p = 12:
+       limite de Amdahl (f ~ 0) ............ 12,00x
+       medido OpenMP ........................ 5,74x  (47,8% do limite)
+       medido MPI ........................... 4,95x  (41,3% do limite)
+     O que falta NAO e "violacao de Amdahl": e a fracao serial EFETIVA,
+     que cresce com p. Quem mede isso e Karp-Flatt (secao 4.8), e as causas
+     estao na secao 9.
+
+
+--------------------------------------------------------------------------------
+ 6. OPENMP — RESULTADOS (escalabilidade forte, N = 4,8e9)
+--------------------------------------------------------------------------------
+
+ 6.1 Como o OpenMP foi feito
+
+ * `#pragma omp parallel` + `#pragma omp for schedule(dynamic, 1)` sobre
+   BLOCOS de 16.384 chaves. Dynamic porque o trabalho NAO e uniforme: a
+   resposta esta em N/3, entao quem pegar os blocos finais nao acha nada.
+ * Condicao de corrida: `std::atomic<bool> parar` (uma thread escreve, todas
+   leem). Escolhido em vez de `critical` porque a leitura acontece 1 vez por
+   bloco (a cada ~14 us), nao a cada chave.
+ * Resultado: cada thread acumula em `melhor_local` (variavel de PILHA,
+   privada) e entra UMA vez em `#pragma omp critical` no final para fundir.
+   `critical` por chave seria um gargalo monstro.
+ * `reduction(min:)` NAO serve: ela exige que o laco termine, e aqui saimos
+   cedo no primeiro acerto.
+ * `omp_set_dynamic(0)`: sem isso a runtime pode entregar menos threads do
+   que o --threads pedido e a curva mente.
+
+ 6.2 Tabela (medianas de dados/bruto.csv)
+
+   threads  T(p) (s)   S(p)     E(p)     Karp-Flatt   S_max delas
+   -------  ---------  ------   ------   ----------   -----------
+      1      1,352755   1,000   100,0%       —            —
+      2      0,697000   1,941    97,0%     3,05%        32,8x
+      4      0,399368   3,387    84,7%     6,03%        16,6x
+      8      0,249195   5,428    67,9%     6,77%        14,8x
+     12      0,235784   5,737    47,8%     9,92%        10,1x
+
+ 6.3 Conta passo a passo (p = 4) — para reproduzir no quadro
+
+   As 5 repeticoes: 0,384563  0,389896  0,399368  0,408736  0,415882
+   Mediana: 0,399368 s
+
+   S(4) = 1,352755 / 0,399368 = 3,3873
+   E(4) = 3,3873 / 4         = 0,8468  -> 84,7%
+   KF(4) = (1/3,3873 - 1/4) / (1 - 1/4)
+         = (0,29522 - 0,25000) / 0,75000
+         = 0,04522 / 0,75000 = 0,0603 -> 6,03%
+   S_max (se essa fracao fosse constante) = 1 / 0,0603 = 16,6x
+
+ 6.4 Conta passo a passo (p = 12) — o ponto que mais assusta
+
+   S(12) = 1,352755 / 0,235784 = 5,7373
+   E(12) = 5,7373 / 12         = 0,4781 -> 47,8%
+   KF(12) = (1/5,7373 - 1/12) / (1 - 1/12)
+          = (0,174298 - 0,083333) / 0,916667
+          = 0,090965 / 0,916667 = 0,0992 -> 9,92%
+   S_max = 1 / 0,0992 = 10,1x
+
+   Ou seja: de 8 para 12 threads o tempo caiu so 5,4% (0,2492 -> 0,2358).
+   Ganhou 0,31x de speedup com +4 threads. Isso NAO e bug: e saturacao de
+   hardware + overhead (secao 9.5). E o numero que o grafico speedup.svg
+   mostra se afastando da reta ideal.
+
+ 6.5 Distribuicao das medicoes (dispersao baixa = medicao confiavel)
+
+   p=2:  0,681887  0,687506  0,697000  0,711357  0,743927
+   p=8:  0,246719  0,248683  0,249195  0,250827  0,252470
+   p=12: 0,229058  0,229104  0,235784  0,240672  0,243651
+
+
+--------------------------------------------------------------------------------
+ 7. MPI — RESULTADOS (escalabilidade forte, N = 4,8e9)
+--------------------------------------------------------------------------------
+
+ 7.1 Como o MPI foi feito
+
+ * Decomposicao: mestre-escravo (o padrao que o PDF destaca para o problema 9).
+   Rank 0 = mestre (nao busca, so distribui e coordena); ranks 1..P-1 =
+   escravos. O espaco de chaves e particionado em BLOCOS de tamanho
+   N / ((P-1) * 128) — ou seja, 128 blocos por escravo.
+ * Por que dinamico e nao fatias fixas: por causa do termino antecipado
+   (a resposta esta em N/3). Com fatia estatica, um escravo pegaria a fatia
+   que contem a resposta e os outros ficariam varrendo regiao inutil.
+ * Operacoes coletivas (o PDF exige pelo menos uma): DUAS.
+     1) MPI_Bcast — rank 0 espalha espaco, alvo e tamanho do bloco;
+     2) MPI_Allreduce com MPI_MIN — consolida a MENOR chave encontrada.
+        MIN preserva a semantica de "primeira ocorrencia" do baseline,
+        independente da ordem de chegada das mensagens.
+ * Protocolo ponto a ponto (mensagens de <= 16 bytes, protocolo eager,
+   sem espera circular, sem deadlock):
+     BLOCO     mestre -> escravo : 2 x uint64 [inicio, fim)
+     PEDIDO    escravo -> mestre : 0 bytes
+     RESULTADO escravo -> mestre : 1 x uint64
+     PARAR     mestre -> escravo : 0 bytes
+ * Custo de mensagem: cada bloco gera 2 mensagens (o PEDIDO recebido + o BLOCO
+   enviado). Com 43 blocos por escravo, ~86 mensagens por escravo — e o que a
+   coluna `mensagens` do CSV mostra (945 / 11 = 85,9).
+
+ 7.2 Tabela (medianas de dados/bruto.csv)
+
+   P    T(P) (s)   S(P)    E(P)=S/P   S/(P-1)   overhead vs (P-1)   msgs
+   ---  ---------  -----   --------   -------   -----------------   ----
+    1   1,348921   1,000    100,0%     100,0%          —              0
+    2   1,413248   0,954     47,7%      95,4%        +4,8%            87
+    4   0,506794   2,662     66,5%      88,7%       +12,7%           259
+    8   0,293373   4,598     57,5%      65,7%       +52,2%           603
+   12   0,272404   4,952     41,3%      45,0%      +122,1%           945
+
+   onde:  T_ideal(P) = T(1)/(P-1)      (so P-1 processos buscam)
+          overhead   = T(P)/T_ideal - 1
+
+ 7.3 Conta passo a passo (P = 12)
+
+   T_ideal = 1,348921 / 11 = 0,122629 s
+   T_medido = 0,272404 s
+   S(12) = 1,348921 / 0,272404 = 4,952
+   E(12) = 4,952 / 12 = 0,4127 -> 41,3%
+   E'(12) = 4,952 / 11 = 0,4502 -> 45,0%   (contra o teto arquitetural P-1)
+   overhead = 0,272404 / 0,122629 - 1 = 1,221 -> +122,1%
+   mensagens = 945 (11 escravos) = 85,9 por escravo
+
+ 7.4 Por que P = 2 da speedup MENOR que 1 (S = 0,954)?
+
+   Porque com P = 2 ha exatamente 1 escravo: o teto teorico ja e 1,0x.
+   Qualquer overhead (Bcast + Allreduce + o proprio relay do mestre) empurra
+   para baixo. Os 4,8% de diferenca SAO o overhead, nao perda de paralelismo.
+   E o mesmo raciocinio de 4.9: aqui `E(P)` "puro" engana; o numero honesto e
+   S/(P-1) = 95,4%.
+
+ 7.5 Comparacao direta com o OpenMP em 12 unidades
+
+   OpenMP 12 threads: 5,737x   (12 unidades buscando)
+   MPI 12 processos:   4,952x   (11 unidades buscando + 1 mestre)
+   5,737 * (11/12) = 5,26x  ->  e o que o MPI "deveria" dar se tivesse o
+   mesmo overhead do OpenMP. Deu 4,95x: a diferenca (5,8%) e o custo de
+   comunicacao/coordenacao que o OpenMP nao tem.
+
+
+--------------------------------------------------------------------------------
+ 8. ESCALABILIDADE FRACA (carga constante por unidade)
+--------------------------------------------------------------------------------
+
+ Regra usada: OpenMP N(p) = 480M * p;  MPI N(P) = 480M * (P-1).
+
+   Unid.   OpenMP                    MPI
+           N          T(s)     E      N          T(s)     E
+   -----   ---------  -------  -----  ---------  -------  -----
+     1     480M       0,133991 100,0% 480M       0,134367 100,0%
+     2     960M       0,142154  94,3% 480M (*)   0,134607  99,8%
+     4     1,92G      0,145182  92,3% 1,44G      0,143270  93,8%
+     8     3,84G      0,198414  67,5% 3,36G      0,199313  67,4%
+    12     5,76G      0,276910  48,4% 5,28G      0,276691  48,6%
+
+  E_fraca(p) = T_base / T(p)  (tempo deveria ficar CONSTANTE)
+  Speedup escalado: S'(p) = p * T_base / T(p)   [MPI: (p-1) no lugar de p]
+
+  S'(12) OpenMP = 12 * 0,133991 / 0,276910 = 5,81x   (Gustafson; ideal = 12)
+  S'(12) MPI    = 11 * 0,134367 / 0,276691 = 5,34x   (ideal = 11)
+
+ (*) O caso MPI com P=2 e DEGENERADO e precisa ser explicado, nao escondido:
+     N(P) = 480M*(P-1) = 480M*1 = 480M, ou seja, o trabalho NAO cresceu em
+     relacao a P=1. Por isso o tempo fica igual (0,1346 s) e a eficiencia
+     "99,8%" e artificial. O primeiro ponto realmente de escala fraca do MPI
+     e P=4. Quem perguntar isso esta testando se voce entendeu o protocolo.
+
+ Leitura dos dados: a escalabilidade fraca vai bem ate 4 unidades (92-94%) e
+ desaba em 8 e 12. Note que o comportamento e QUASE IDENTICO entre OpenMP e
+ MPI (67,5% vs 67,4% em 8; 48,4% vs 48,6% em 12). Quando dois paradigmas
+ diferentes falham do mesmo jeito, a causa nao e o codigo — e o HARDWARE
+ (secao 9.5). Esse e o argumento mais forte da apresentacao.
+
+
+--------------------------------------------------------------------------------
+ 9. POR QUE A CURVA SE AFASTA DE AMDAHL
+--------------------------------------------------------------------------------
+
+ O PDF pede explicitamente a discussao de: overhead de comunicacao,
+ desbalanceamento de carga, false sharing e limite de banda de memoria.
+ Segue cada um, com evidencia numerica do proprio projeto.
+
+ 9.1 OVERHEAD DE COMUNICACAO (MPI)
+
+   Evidencia: overhead vs ideal (P-1) cresce 4,8% -> 12,7% -> 52,2% -> 122,1%
+   quando P vai de 2 a 12, enquanto o VOLUME de dados e ridiculo:
+   945 mensagens x 16 bytes = ~15 KB no total. 15 KB em 0,27 s = 0,06 MB/s.
+
+   Conclusao: nao e BANDA, e LATENCIA + SERIALIZACAO. Cada bloco exige um
+   round-trip escravo->mestre->escravo. Com blocos menores (mais P), o numero
+   de round-trips por unidade de trabalho cresce (86 por escravo, sempre), e o
+   mestre vira um ponto de serializacao: ele atende um pedido por vez.
+
+   Como melhoraria: MPI_Rsend/persistent requests, blocos maiores com
+   work-stealing, ou MPI_Irecv + computacao (overlap). Custa complexidade.
+
+ 9.2 DESBALANCEAMENTO DE CARGA / TERMINO ANTECIPADO
+
+   Evidencia: no OpenMP, a amplitude entre a melhor e a pior thread nao
+   aparece no CSV, mas aparece no tempo: p=12 tem 5 medicoes entre 0,229058 e
+   0,243651 (6,2% de amplitude), maior que p=8 (2,3%). Quanto mais threads,
+   maior a chance de uma "atrasar" o final.
+
+   Mecanismo: o tempo total = tempo da ULTIMA unidade a terminar (straggler).
+   Com termino antecipado, no instante em que uma thread acha a chave, as
+   outras estao no meio de um bloco de 16.384 chaves (~14 us) — pequeno, mas
+   com 12 threads o efeito se acumula; no MPI o bloco e muito maior
+   (N/((P-1)*128) = 3,4M chaves = ~2,9 ms), entao o desperdicio final e maior.
+
+   E por isso que block size e um trade-off: bloco pequeno = menos desperdicio
+   no fim, mais overhead de coordenacao; bloco grande = o contrario.
+
+ 9.3 FALSE SHARING
+
+   Evidencia/argumento: NAO existe false sharing neste projeto, e da para
+   provar pelo codigo:
+     * nao ha vetor compartilhado escrito pelas threads (a busca nao usa
+       memoria auxiliar);
+     * `melhor_local` e variavel de PILHA, uma por thread;
+     * `melhor` (global) e escrito 1 vez por thread, dentro do `critical`;
+     * `parar` e UMA variavel atomic<bool>, lida 1 vez por BLOCO (a cada
+       16.384 chaves, ~14 us). Uma linha de cache transferida a cada 14 us e
+       irrelevante perto do trabalho util.
+
+   O que SERIA false sharing aqui?: seria se cada thread
+   escrevesse em posicoes vizinhas de um mesmo vetor de resultados (ex.:
+   `resultados[tid] = ...` com uint64_t adjacentes) — a cache line de 64 bytes
+   seria disputada e cada escrita invalidaria a linha das outras. A solucao
+   classica e padding (alignas(64)) ou acumulador local + reducao no fim,
+   que e exatamente o que o codigo ja faz.
+
+ 9.4 LIMITE DE BANDA DE MEMORIA
+
+   Evidencia: o baseline faz 1,19 G chaves/s sem ler NENHUM byte de dados
+   (cada chave e derivada do indice do laco). O trabalho e 3 imul + 3 shifts
+   por chave; a taxa (~3 ciclos por chave a 3,5 GHz) e compativel com a
+   latencia de uma cadeia de multiplicacoes, nao com acesso a memoria.
+
+   Conclusao honesta: neste problema a banda de memoria NAO e o limitante.
+   Numa multiplicacao de matrizes (problema 1 da lista) seria — e a discussao
+   seria outra. Dizer isso mostra que voce entendeu POR QUE o limite nao se
+   aplica, em vez de repetir o slide.
+
+ 9.5 HETEROGENEIDADE DO HARDWARE (a causa que Amdahl nao modela)
+
+   Dados: OpenMP 4 -> 8 threads ganha +60% de speedup (3,387 -> 5,428), mas
+   8 -> 12 threads ganha apenas +5,7% (5,428 -> 5,737). MPI repete o padrao.
+
+   Maquina: i5-1235U = 2 P-cores (com HT) + 8 E-cores. Os E-cores tem IPC e
+   clock menores; as 4 threads logicas dos P-cores dividem o mesmo nucleo
+   fisico (SMT). Resultado pratico: "12 CPUs" nao valem 12 nucleos iguais. A
+   curva satura perto dos 10 nucleos (dos quais 8 sao E-cores lentos), e nao
+   em 12 — que e exatamente o que os dados mostram.
+
+   Isso explica por que a escalabilidade fraca de OpenMP e MPI falha IGUAL
+   (67% em 8; 48% em 12): o gargalo e comum e esta embaixo do codigo.
+
+   Na maquina do laboratorio (nucleos homogeneos), a curva deve subir mais.
+   Se o professor rodar la e o numero for melhor, isso CONFIRMA a explicacao.
+
+ 9.6 RESUMO DA DISCUSSAO
+
+   "A curva fica abaixo de Amdahl por quatro somas: overhead de coordenacao
+   no MPI (latencia, nao banda), desbalanceamento por termino antecipado
+   (straggler), saturacao de SMT/E-cores no hardware, e o custo de fork/join +
+   atomic no OpenMP. False sharing e banda de memoria foram descartados com
+   evidencia: nao ha estado compartilhado escrito em laco e nao ha leitura de
+   dados. A fracao serial efetiva (Karp-Flatt) sobe de 3,05% para 9,92% com p,
+   o que mostra que o termo 'serial' de Amdahl, aqui, e na verdade overhead
+   dependente de p — e nao codigo sequencial."
+
+
+--------------------------------------------------------------------------------
+ 10. TABELA FINAL — UMA LINHA POR CRITERIO DE AVALIACAO
+--------------------------------------------------------------------------------
+
+ Criterio do PDF                      Numero que prova            Onde
+ -----------------------------------  --------------------------  ----------
+ Baseline + perfilamento + Amdahl     1,357 s; laco 82-100%;      sec. 2, 5
+                                      f=17,97% -> Smax=5,57x
+ OpenMP correta + corrida + speedup   S=5,74x; E=47,8%; 70/70 OK  sec. 6
+ MPI correta + decomposicao + coletiva S=4,95x; E/(P-1)=45%;      sec. 7
+                                      Bcast + Allreduce(MIN)
+ Analise experimental + discussao      forte e fraca; 4 causas     sec. 8, 9
+                                      descartadas/confirmadas
+ Documentacao                         README roda do zero;        sec. 12
+                                      Makefile; CSV; graficos
+
+--------------------------------------------------------------------------------
+ 11. COMO REPRODUZIR (comandos exatos)
+--------------------------------------------------------------------------------
+
+ # 1) compilar tudo (deve sair sem warning)
+ make
+
+ # 2) provar corretude contra o baseline  (imprime 70/70 OK)
+ make validar
+
+ # 3) gerar as medicoes (5 repeticoes + aquecimento; ~2 min)
+ make dados
+
+ # 4) gerar dados/resultados.csv e os 4 graficos SVG
+ make graficos
+
+ # demonstracao ao vivo (o PDF exige que rode de verdade)
+ ./bin/sequencial 60000000
+ ./bin/openmp    60000000 --threads=8
+ mpirun -np 8 ./bin/mpi 60000000
+ # as tres devem imprimir chave=20000000
+
+ Se estiver no Windows, tudo isso dentro do container:
+   docker build -t pp-busca -f docker/Dockerfile .
+   MSYS_NO_PATHCONV=1 docker run --rm -it -v "$(pwd -W):/projeto" \
+       -w /projeto pp-busca bash
+
+ Regerar so uma medicao pontual (util se o professor pedir "roda agora"):
+   for i in 1 2 3 4 5; do ./bin/openmp 4800000000 --threads=12; done
+   -> tirar a mediana de tempo_busca das 5 linhas na mao.
+
+
+--------------------------------------------------------------------------------
+ 12. GLOSSARIO RAPIDO (para nao travar em terminologia)
+--------------------------------------------------------------------------------
+
+ Speedup (S)        T(1)/T(p). Quanto mais rapido com p unidades.
+ Eficiencia (E)     S/p. Aproveitamento por unidade (0-100%).
+ Custo (C)          p*T(p). E = T(1)/C. Custo otimo = custo constante.
+ Escala forte       N fixo, p cresce. Mede "mesmo trabalho mais rapido".
+ Escala fraca       N cresce com p. Mede "cabe mais trabalho no mesmo tempo".
+ Fracao serial (f)  Parte do tempo que nao paraleliza. Smax = 1/f (Amdahl).
+ Karp-Flatt (e)     Fracao serial EFETIVA extraida dos dados medidos.
+ Hotspot            Trecho onde o programa gasta a maior parte do tempo.
+ Straggler          Unidade mais lenta, que define o tempo total (barreira).
+ False sharing      Duas threads escrevendo na MESMA linha de cache sem
+                    compartilhar dado -> invalida cache e derruba desempenho.
+ Termino antecipado A busca para no primeiro acerto; o trabalho restante e
+                    desperdicio e e o que motiva a distribuicao dinamica.
+ Overhead eager     MPI envia mensagens pequenas sem handshake; evita deadlock
+                    circular no protocolo mestre-escravo deste projeto.
+
+================================================================================
+ Calculos nas secoes 5.2, 6.3/6.4 ou 7.3. 
+ Estao com todos os valores intermediarios.
+================================================================================

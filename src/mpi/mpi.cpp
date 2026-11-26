@@ -1,5 +1,5 @@
 // ============================================================================
-//  mpi.cpp — versão de memória distribuída (somente mestre-escravo)
+//  mpi.cpp — versão de memória distribuída (mestre-escravo)
 //  Problema 9 — Busca exaustiva (força bruta)
 //  Programação Paralela (CCO085) — 2026/2
 //
@@ -13,7 +13,7 @@
 //  Por que só esse padrão? É o destacado no enunciado, mantém o código curto
 //  e permite discutir o principal afastamento da Lei de Amdahl: com P processos
 //  apenas P-1 buscam, então o speedup máximo é P-1 e a eficiência (P-1)/P.
-//  A decisão está registrada em docs/DECISAO_MPI.md.
+//  A decisão está registrada em docs/ANALISE_EXPERIMENTAL.txt (seção 7).
 //
 //  OPERAÇÕES COLETIVAS (pedido do enunciado: pelo menos uma)
 //  ---------------------------------------------------------
@@ -33,7 +33,7 @@
 //  As mensagens têm no máximo 16 bytes, então usam o protocolo eager do MPI:
 //  não há espera circular de buffer e, portanto, não há deadlock.
 //
-//  LEITURA GUIADA (exemplo comentado em docs/GUIA_INICIANTE.md):
+//  LEITURA GUIADA:
 //    1. `MPI_Init` abre o ambiente; o mesmo `main` roda em P cópias;
 //    2. cada cópia descobre seu `rank` (crachá) e qual é seu papel;
 //    3. `MPI_Bcast` espalha os parâmetros para todo mundo;
@@ -54,6 +54,8 @@ namespace {
 // Cada mensagem é como um envelope com um RÓTULO dizendo o que há dentro.
 // Sem rótulo, quem recebe não saberia se chegou um bloco, um pedido ou um
 // "pare". `enum` só dá nomes amigáveis para os números 1, 2, 3 e 4.
+
+// ---------------------CONFIG DE MENSAGENS E ESPAÇO-------------------------
 enum Tag { TAG_BLOCO = 1, TAG_PEDIDO = 2, TAG_RESULTADO = 3, TAG_PARAR = 4 };
 
 // Varre um intervalo contíguo e para no primeiro acerto, como o baseline.
@@ -65,7 +67,7 @@ uint64_t varrer(uint64_t inicio, uint64_t fim, uint64_t alvo) {
 }
 
 uint64_t contar_blocos(uint64_t espaco, uint64_t bloco) {
-    return espaco / bloco + (espaco % bloco != 0 ? 1 : 0);
+    return espaco / bloco + (espaco % bloco != 0 ? 1 : 0); //arredonda para uma unidade a mais caso a divisao nao seja exata
 }
 
 // A ordem dos argumentos do MPI_Send é:
@@ -90,20 +92,19 @@ void enviar_sinal(int destino) {
 // já é completa. Por isso não precisamos de um MPI_Reduce extra só para isso.
 // O `&` em `long long& mensagens` é uma referência: a contagem feita aqui
 // aparece no `main` que chamou esta função.
-uint64_t mestre(uint64_t espaco, uint64_t bloco, int processos,
-                long long& mensagens) {
+uint64_t mestre(uint64_t espaco, uint64_t bloco, int processos,long long& mensagens) {
+
     const uint64_t blocos = contar_blocos(espaco, bloco);
     uint64_t proximo = 0;   // índice do próximo bloco ainda não entregue
     uint64_t melhor = NAO_ENCONTRADO;
-    int ativos = 0;         // quantos escravos ainda podem pedir trabalho
+    int ativos = 0;         // quantos slaves estao em trabalho
 
     // Despacho inicial: um bloco para cada escravo que ainda tenha trabalho.
     // O rank 0 é o mestre, então os escravos são 1, 2, ..., processos-1.
     for (int destino = 1; destino < processos; ++destino) {
         if (proximo < blocos) {
             const uint64_t inicio = proximo * bloco;
-            const uint64_t fim = (espaco - inicio < bloco) ? espaco
-                                                           : inicio + bloco;
+            const uint64_t fim = (espaco - inicio < bloco) ? espaco : inicio + bloco;
             enviar_bloco(destino, inicio, fim);
             ++mensagens;
             ++proximo;
@@ -123,8 +124,7 @@ uint64_t mestre(uint64_t espaco, uint64_t bloco, int processos,
     while (ativos > 0) {
         uint64_t dado = 0;
         MPI_Status status;
-        MPI_Recv(&dado, 1, MPI_UINT64_T, MPI_ANY_SOURCE, MPI_ANY_TAG,
-                 MPI_COMM_WORLD, &status);
+        MPI_Recv(&dado, 1, MPI_UINT64_T, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
         ++mensagens;
 
         if (status.MPI_TAG == TAG_RESULTADO) {
@@ -136,8 +136,7 @@ uint64_t mestre(uint64_t espaco, uint64_t bloco, int processos,
         // TAG_PEDIDO: entrega o próximo bloco ou encerra esse escravo.
         if (proximo < blocos) {
             const uint64_t inicio = proximo * bloco;
-            const uint64_t fim = (espaco - inicio < bloco) ? espaco
-                                                           : inicio + bloco;
+            const uint64_t fim = (espaco - inicio < bloco) ? espaco : inicio + bloco;
             enviar_bloco(status.MPI_SOURCE, inicio, fim);
             ++mensagens;
             ++proximo;
@@ -162,7 +161,7 @@ uint64_t mestre(uint64_t espaco, uint64_t bloco, int processos,
 
 // ------------------------------- ESCRAVO ------------------------------------
 void escravo(uint64_t alvo) {
-    // `for (;;)` é um laço sem condição: ele só termina no `break` abaixo.
+    // `for (;;)` é um laço sem condição que ele só finaliza no break.
     // O escravo vive nesse ciclo: recebe bloco -> varre -> pede outro.
     for (;;) {
         uint64_t dados[2] = {0, 0};
@@ -172,10 +171,10 @@ void escravo(uint64_t alvo) {
 
         if (status.MPI_TAG == TAG_PARAR) break;
 
-        const uint64_t achado = varrer(dados[0], dados[1], alvo);
+        const uint64_t chave = varrer(dados[0], dados[1], alvo);
         uint64_t valor = 0;
-        if (achado != NAO_ENCONTRADO) {
-            valor = achado;
+        if (chave != NAO_ENCONTRADO) {
+            valor = chave;
             MPI_Send(&valor, 1, MPI_UINT64_T, 0, TAG_RESULTADO, MPI_COMM_WORLD);
         } else {
             // Sem conteúdo: só avisa "estou livre, me dê outro bloco".
@@ -214,9 +213,8 @@ int main(int argc, char** argv) {
     // 128 blocos por escravo é uma escolha simples e estável.
     // Quem busca são P-1 processos (o rank 0 só coordena), por isso dividimos
     // por `trabalhadores`. `static_cast` só converte `int` para `uint64_t`.
-    const uint64_t trabalhadores = (processos > 1)
-                                       ? static_cast<uint64_t>(processos - 1)
-                                       : 1;
+    const uint64_t trabalhadores = (processos > 1) ? static_cast<uint64_t> (processos - 1) : 1;
+    
     uint64_t bloco = cfg.espaco / (trabalhadores * 128);
     if (bloco < 16384) bloco = 16384;
 

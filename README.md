@@ -5,7 +5,7 @@
 > **Docente:** Prof. Rodrigo Gonçalves  
 > **Implementações:** Sequencial (baseline original), OpenMP (memória compartilhada) e MPI (memória distribuída — mestre-escravo)
 
-> **Guia didático complementar:** Para uma explicação passo a passo da arquitetura e da execução, consulte [`docs/GUIA_INICIANTE.md`](docs/GUIA_INICIANTE.md).
+> **Documento de sustentação:** os cálculos de speedup, eficiência, escalabilidade e Lei de Amdahl — com as contas passo a passo — estão em [`docs/ANALISE_EXPERIMENTAL.txt`](docs/ANALISE_EXPERIMENTAL.txt).
 
 ---
 
@@ -58,7 +58,7 @@ make graficos     # Agrega resultados em dados/resultados.csv e gera os gráfico
 
 ### Execução via Docker (Windows / Ambientes Isolados)
 
-O projeto inclui um `Dockerfile` configurado com `g++`, Open MPI e Python (`matplotlib`):
+O projeto inclui um `Dockerfile` configurado com `g++`, Open MPI e Python 3 (os gráficos usam apenas a biblioteca padrão):
 
 ```bash
 docker build -t pp-busca -f docker/Dockerfile .
@@ -84,6 +84,26 @@ mpirun -np 8 ./bin/mpi 60000000
 
 As três execuções imprimem exatamente a mesma chave encontrada (`20000000`). Nos scripts automatizados, utiliza-se `--use-hwthread-cpus` no `mpirun` para permitir escalar `-np` até o total de CPUs lógicas da máquina.
 
+### Compilando um Arquivo Isolado
+
+Os alvos do `Makefile` já passam todas as flags necessárias. Se for compilar um
+arquivo manualmente, duas flags não são opcionais:
+
+```bash
+# OpenMP
+g++ -O2 -std=c++17 -fopenmp -Isrc src/openmp/openmp.cpp -o bin/openmp
+
+# MPI — o compilador precisa ser o mpicxx (não o g++), e o -Isrc é obrigatório
+mpicxx -O2 -std=c++17 -DOMPI_SKIP_MPICXX -Isrc src/mpi/mpi.cpp -o bin/mpi
+```
+
+| Erro | Causa |
+|---|---|
+| `fatal error: mpi.h: No such file or directory` | usou `g++` em vez de `mpicxx`; o `mpi.h` vem do Open MPI, que o `mpicxx` adiciona automaticamente (`mpicxx -show` mostra os caminhos) |
+| `fatal error: comum/busca.hpp: No such file or directory` | faltou `-Isrc`; o include é relativo à pasta `src/`, não à pasta do `.cpp` |
+
+Ao compilar de dentro de `src/mpi/`, troque `-Isrc` por `-I..`.
+
 ---
 
 ## 3. Estrutura do Repositório
@@ -93,9 +113,9 @@ As três execuções imprimem exatamente a mesma chave encontrada (`20000000`). 
 ├── Makefile                     # Automação de compilação, validação, coleta e gráficos
 ├── README.md                    # Documentação técnica e análise experimental
 ├── docs/
-│   ├── baseline_sequencial.cpp  # Código sequencial original fornecido pelo professor (intocado)
-│   ├── DECISAO_MPI.md           # Justificativa arquitetural do padrão mestre-escravo
-│   └── GUIA_INICIANTE.md        # Material explicativo detalhado do código e conceitos
+│   ├── ANALISE_EXPERIMENTAL.txt # Cálculos de speedup, eficiência e Lei de Amdahl (sustentação)
+│   ├── Projeto_Academico_PP_20262.pdf  # Enunciado do professor
+│   └── baseline_sequencial.cpp  # Código sequencial original fornecido pelo professor (intocado)
 ├── src/
 │   ├── comum/busca.hpp          # Função hash, parsing de argumentos e saída padronizada
 │   ├── openmp/openmp.cpp        # Implementação paralela em memória compartilhada (OpenMP)
@@ -127,7 +147,7 @@ As três execuções imprimem exatamente a mesma chave encontrada (`20000000`). 
 |---|---|
 | Baseline, perfilamento e Lei de Amdahl | Seções 6 e 8; `dados/perfilamento.csv` |
 | Versão OpenMP com tratamento de corrida e curva de speedup | `src/openmp/openmp.cpp`; `graficos/speedup.svg` |
-| Versão MPI com decomposição, coletivas e curva de speedup | `src/mpi/mpi.cpp`; `docs/DECISAO_MPI.md` |
+| Versão MPI com decomposição, coletivas e curva de speedup | `src/mpi/mpi.cpp`; `docs/ANALISE_EXPERIMENTAL.txt` (seção 7) |
 | Validação de corretude contra o gabarito sequencial | `scripts/validar.sh` (`make validar`) |
 | Gráficos de tempo, speedup, eficiência e escalabilidade | `graficos/*.svg` (`make graficos`) |
 | Análise de escalabilidade fraca | Seção 7; `graficos/escalabilidade_fraca.svg` |
@@ -149,7 +169,7 @@ As três execuções imprimem exatamente a mesma chave encontrada (`20000000`). 
 
 * **Decomposição mestre-escravo:** Conforme destacado na especificação do Problema 9, o processo de rank `0` atua como **mestre** (coordenador) e os ranks $1 \dots P-1$ atuam como **escravos** (trabalhadores). O mestre distribui intervalos `[início, fim)` sob demanda; os escravos retornam mensagens com tag `PEDIDO` (ao concluir um bloco sem sucesso) ou `RESULTADO` (ao encontrar o alvo), momento em que o mestre difunde a tag `PARAR` aos demais.
 * **Operações coletivas:** Utiliza-se `MPI_Bcast` no início da execução para difundir os parâmetros da busca (`espaco`, `alvo` e `bloco`) e `MPI_Allreduce(..., MPI_MIN, ...)` ao final para consolidar globalmente a menor chave encontrada. O operador `MPI_MIN` assegura determinismo idêntico ao baseline sequencial, independentemente da ordem de chegada das mensagens assíncronas.
-* **Teto teórico:** Como o rank `0` dedica-se exclusivamente à coordenação, apenas $P - 1$ processos realizam cálculos de hash, impondo um teto teórico de eficiência igual a $\frac{P - 1}{P}$. O detalhamento dessa escolha está documentado em [`docs/DECISAO_MPI.md`](docs/DECISAO_MPI.md).
+* **Teto teórico:** Como o rank `0` dedica-se exclusivamente à coordenação, apenas $P - 1$ processos realizam cálculos de hash, impondo um teto teórico de eficiência igual a $\frac{P - 1}{P}$. O detalhamento dessa escolha está documentado em [`docs/ANALISE_EXPERIMENTAL.txt`](docs/ANALISE_EXPERIMENTAL.txt) (seções 4.9 e 7).
 
 ---
 

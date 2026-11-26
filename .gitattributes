@@ -1,0 +1,15 @@
+# ============================================================================
+#  .gitattributes — mantém LF nos arquivos que rodam dentro do container Linux
+#
+#  No Windows o Git costuma estar com core.autocrlf=true, que converte o texto
+#  para CRLF no checkout. O bash então lê o "\r" como parte do comando e
+#  scripts/validar.sh morre com:
+#      set: pipefail: invalid option name
+#      scripts/validar.sh: line 12: $'\r': command not found
+#
+#  As regras abaixo valem sobre o core.autocrlf e garantem LF no checkout.
+# ============================================================================
+*.sh               text eol=lf
+*.py               text eol=lf
+Makefile           text eol=lf
+docker/Dockerfile  text eol=lf

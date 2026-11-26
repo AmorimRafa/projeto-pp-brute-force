@@ -50,9 +50,29 @@ WORKDIR /projeto
 COPY . .
 
 # Verificação rápida do toolchain e dos arquivos durante o build.
-RUN g++ --version | head -1 \
+# O "contexto" do build precisa ser a RAIZ do repositório. Se você rodar o
+# build de dentro de docker/ (ou usar "docker build docker"), o COPY . . não
+# traz Makefile/src/docs e o build falha aqui — por isso a mensagem explícita.
+RUN if [ ! -f Makefile ] || [ ! -f docs/baseline_sequencial.cpp ]; then \
+        echo "" >&2; \
+        echo "ERRO: contexto de build incorreto (faltam Makefile e/ou docs/)." >&2; \
+        echo "Rode o build a partir da RAIZ do repositório, com -f:" >&2; \
+        echo "" >&2; \
+        echo "    docker build -t pp-busca -f docker/Dockerfile ." >&2; \
+        echo "" >&2; \
+        exit 1; \
+    fi \
+    && g++ --version | head -1 \
     && mpicxx --version | head -1 \
     && python3 --version \
-    && test -f Makefile && test -f docs/baseline_sequencial.cpp && echo "projeto copiado OK"
+    && echo "projeto copiado OK"
+
+# Normaliza fim de linha. Num checkout Windows com core.autocrlf=true os
+# arquivos chegam com CRLF e o bash morre em "set: pipefail: invalid option
+# name" ao rodar scripts/validar.sh e scripts/coletar.sh.
+# O .gitattributes do repositório já pede LF, mas esta linha protege quem
+# clonou o projeto antes dele ou tem o Git configurado de outro jeito.
+RUN sed -i 's/\r$//' Makefile scripts/*.sh scripts/*.py \
+    && echo "fim de linha normalizado (LF)"
 
 CMD ["bash"]

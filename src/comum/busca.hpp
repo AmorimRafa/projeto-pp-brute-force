@@ -78,8 +78,12 @@ inline double agora() {
 //  Repete-se o par duas vezes e faz-se um último XOR: é o "finalizador" do
 //  MurmurHash3. As constantes foram copiadas do baseline — não são inventadas.
 inline uint64_t hash_chave(uint64_t k) {
-    k ^= k >> 33; k *= 0xff51afd7ed558ccdULL;
-    k ^= k >> 33; k *= 0xc4ceb9fe1a85ec53ULL;
+    k ^= k >> 33; 
+    k *= 0xff51afd7ed558ccdULL;
+
+    k ^= k >> 33; 
+    k *= 0xc4ceb9fe1a85ec53ULL;
+    
     k ^= k >> 33; return k;
 }
 
@@ -197,9 +201,8 @@ inline void imprimir_resultado(const Resultado& r) {
     // O sentinela interno (2^64-1) aparece para o usuário como -1.
     // `static_cast<long long>(...)` só avisa ao compilador que queremos
     // explicitamente converter o tipo para imprimir.
-    long long chave_impressa = (r.chave == NAO_ENCONTRADO)
-                                   ? -1LL
-                                   : static_cast<long long>(r.chave);
+    long long chave_impressa = (r.chave == NAO_ENCONTRADO) ? -1LL : static_cast<long long>(r.chave);
+
     std::printf(
         "versao=%s espaco=%" PRIu64 " alvo=%" PRIu64 " chave=%lld"
         " threads=%d processos=%d tempo_busca=%.6f mensagens=%lld\n",

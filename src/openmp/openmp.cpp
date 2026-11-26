@@ -10,9 +10,9 @@
 //  demanda (schedule(dynamic, 1)). Assim todas as threads avançam "lado a
 //  lado" e a parada antecipada não deixa ninguém preso num trecho gigante.
 //
-//  CONDIÇÃO DE CORRIDA — decisões explícitas (pedido do enunciado)
+//  CONDIÇÃO DE CORRIDA
 //  ---------------------------------------------------------------
-//  * `parar` é std::atomic<bool>: uma thread escreve, todas leem. Sem atomic
+//  * `parar` -> std::atomic<bool>: uma thread escreve e todas leem. Sem atomic
 //    haveria corrida. Foi escolhido atomic (e não critical) porque é só um
 //    booleano e a leitura acontece no início de cada bloco, não a cada chave.
 //  * `melhor_local` é variável de pilha, privada de cada thread. No fim, cada
@@ -22,14 +22,6 @@
 //    aqui nós saímos cedo quando encontramos a chave.
 //  * Não existe vetor compartilhado escrito pelas threads; portanto não há
 //    FALSE SHARING (duas threads disputando a mesma linha de cache).
-//
-//  LEITURA GUIADA (exemplo comentado em docs/GUIA_INICIANTE.md):
-//    1. `main` prepara a configuração e liga o cronômetro;
-//    2. `#pragma omp parallel` cria a equipe de threads;
-//    3. `#pragma omp for schedule(dynamic,1)` entrega blocos sob demanda;
-//    4. o laço interno chama o hash — idêntico ao baseline;
-//    5. `atomic` + `critical` resolvem a condição de corrida;
-//    6. `imprimir_resultado` gera a linha que os scripts leem.
 // ============================================================================
 #include <omp.h>
 
@@ -55,21 +47,20 @@ inline uint64_t total_de_blocos(uint64_t espaco) {
 
 int main(int argc, char** argv) {
     Configuracao cfg;
-    if (!ler_argumentos(argc, argv, cfg)) return 2;
+    if (!ler_argumentos(argc, argv, cfg)) return 2; //
+
     if (cfg.ajuda) {
         imprimir_ajuda(argv[0]);
         return 0;
     }
 
-    // "Não ajuste o número de threads sozinho, mantenha as N que eu pedi."
-    // Sem isso, a biblioteca poderia criar menos threads em uma repetição e
-    // a medição ficaria difícil de comparar.
-    omp_set_dynamic(0);
+    omp_set_dynamic(0); 
+    //bloqueia o ajuste dinamico do openMP 
+    //Garante que todas as threads selecionadas serão usadas 
 
     // Se o usuário não passou --threads, usamos o padrão do ambiente.
     // É o operador curto `cond ? sim : nao` de novo.
-    int threads = (cfg.threads > 0) ? cfg.threads : omp_get_max_threads();
-    if (threads < 1) threads = 1;
+    int threads = (cfg.threads > 0 ) ? cfg.threads : omp_get_max_threads();
 
     const uint64_t blocos = total_de_blocos(cfg.espaco);
     const uint64_t alvo = cfg.alvo;
@@ -103,24 +94,19 @@ int main(int argc, char** argv) {
         // antecipada (a resposta fica em 1/3 do espaço).
 #pragma omp for schedule(dynamic, 1)
         for (uint64_t b = 0; b < blocos; ++b) {
-            // Flag verificada no início do bloco. Se outra thread já achou,
-            // simplesmente pulamos. O desperdício é de no máximo um bloco.
-            // `load` = "ler"; `relaxed` = "só preciso que a leitura seja
-            // atômica, não preciso ordenar outros dados". É a opção mais
-            // barata e suficiente aqui. `continue` pula para o próximo bloco.
+            // Flag que registra globalmente para todas as threads se o valor já foi achado
+            // "Continue" pula o laco que navega entre as chaves
             if (parar.load(std::memory_order_relaxed)) continue;
 
             // O último bloco pode ser menor que BLOCO; o `?:` aqui é um
             // "mínimo" escrito na mão: fim = min(inicio + BLOCO, espaco).
             const uint64_t inicio_bloco = b * BLOCO;
-            const uint64_t fim_bloco =
-                (cfg.espaco - inicio_bloco < BLOCO) ? cfg.espaco
-                                                    : inicio_bloco + BLOCO;
+            const uint64_t fim_bloco = (cfg.espaco - inicio_bloco < BLOCO) ? cfg.espaco : inicio_bloco + BLOCO;
 
             // O laço de verdade: testa uma chave por vez, como o baseline.
             for (uint64_t k = inicio_bloco; k < fim_bloco; ++k) {
                 if (hash_chave(k) == alvo) {
-                    melhor_local = k;                              // guarda o achado
+                    melhor_local = k;                              // guarda a chave
                     parar.store(true, std::memory_order_relaxed);  // avisa as outras
                     break;  // sai SÓ deste laço interno; a thread ainda
                             // continuará no laço de blocos, mas vai pular todos.
@@ -135,7 +121,10 @@ int main(int argc, char** argv) {
         // O `<` (menor índice) reproduz a ideia de "primeira ocorrência".
 #pragma omp critical(fusao_resultado)
         {
-            if (melhor_local < melhor) melhor = melhor_local;
+            if (melhor_local < melhor) {
+                melhor = melhor_local;
+            }
+            
         }
     }
 
